@@ -78,28 +78,45 @@ class CustomAgent(Player):
     def choose_move(self, battle: AbstractBattle):
         my_pokemon = battle.active_pokemon
 
-        # If you're low on HP
-        if my_pokemon.current_hp_fraction < 0.25:
-            # Try to heal if a healing move is available
-            healing_moves = {"roost", "recover", "morning sun", "moonlight", "slack off", "milk drink", "soft-boiled"}
-            for move in battle.available_moves:
-                if move.id in healing_moves:
-                    return self.create_order(move)
+        if my_pokemon.fainted:
+            if battle.available_switches:
+                return self.create_order(battle.available_switches[0])
+            return self.choose_random_move(battle)
 
-            # Otherwise, switch to the healthiest available teammate
+        if my_pokemon.status in {"slp", "frz"}:
             if battle.available_switches:
                 best_switch = max(battle.available_switches, key=lambda p: p.current_hp_fraction)
                 return self.create_order(best_switch)
 
-        # Default: use strongest available move
+        if my_pokemon.current_hp_fraction < 0.25:
+            healing_moves = {"roost", "recover", "morningsun", "moonlight", "slackoff", "milkdrink", "softboiled"}
+            for move in battle.available_moves:
+                if move.id in healing_moves:
+                    return self.create_order(move)
+            if battle.available_switches:
+                best_switch = max(battle.available_switches, key=lambda p: p.current_hp_fraction)
+                return self.create_order(best_switch)
+
         if battle.available_moves:
-            best_move = max(battle.available_moves, key=lambda move: move.base_power or 0)
+            opponent = battle.opponent_active_pokemon
+
+            def move_score(move):
+                if not move.base_power or not move.type or not opponent:
+                    return 0
+                try:
+                    multiplier = move.type.damage_multiplier(*opponent.types, type_chart=move._type_chart)
+                except Exception:
+                    multiplier = 1.0
+                stab = 1.5 if move.type in {my_pokemon.type_1, my_pokemon.type_2} else 1.0
+                return move.base_power * multiplier * stab
+
+            best_move = max(battle.available_moves, key=move_score)
+
+            if battle.can_tera:
+                return self.create_order(best_move, terastallize=True)
             return self.create_order(best_move)
 
-        # Fallback: switch to anything
         if battle.available_switches:
             return self.create_order(battle.available_switches[0])
 
         return self.choose_random_move(battle)
-
-        
