@@ -4,140 +4,68 @@ import numpy as np
 from poke_env.teambuilder import Teambuilder
 
 team = """
-Moltres @ Heavy-Duty Boots  
-Ability: Flame Body  
-Tera Type: Grass  
-EVs: 248 HP / 248 Def / 12 Spe  
-Bold Nature  
-- Flamethrower  
-- Roar  
+Dragapult @ Heavy-Duty Boots  
+Ability: Cursed Body  
+Tera Type: Dragon  
+EVs: 60 Atk / 196 SpA / 252 Spe  
+Naive Nature  
+- Dragon Darts  
+- Hex  
+- Will-O-Wisp  
 - U-turn  
+
+Dragonite (F) @ Heavy-Duty Boots  
+Ability: Multiscale  
+Tera Type: Normal  
+EVs: 104 HP / 252 Atk / 152 Spe  
+Adamant Nature  
+- Dragon Dance  
+- Earthquake  
+- Extreme Speed  
 - Roost  
-
-Zamazenta @ Heavy-Duty Boots  
-Ability: Dauntless Shield  
-Tera Type: Fire  
-EVs: 252 Atk / 4 SpD / 252 Spe  
-Jolly Nature  
-- Close Combat  
-- Crunch  
-- Stone Edge  
-- Ice Fang  
-
-Darkrai @ Heavy-Duty Boots  
-Ability: Bad Dreams  
-Shiny: Yes  
-Tera Type: Poison  
-EVs: 4 Def / 252 SpA / 252 Spe  
-Timid Nature  
-- Dark Pulse  
-- Knock Off  
-- Sludge Bomb  
-- Ice Beam  
-
-Hydrapple (M) @ Heavy-Duty Boots  
-Ability: Regenerator  
-Tera Type: Poison  
-EVs: 244 HP / 172 Def / 88 SpA / 4 Spe  
-Bold Nature  
-IVs: 0 Atk  
-- Nasty Plot  
-- Fickle Beam  
-- Giga Drain  
-- Earth Power  
 
 Ting-Lu @ Leftovers  
 Ability: Vessel of Ruin  
 Tera Type: Water  
-EVs: 248 HP / 8 Def / 252 SpD  
+EVs: 248 HP / 252 SpD / 8 Spe  
 Careful Nature  
-- Spikes  
+- Stealth Rock  
 - Ruination  
 - Earthquake  
 - Whirlwind  
 
-Tinkaton @ Air Balloon  
-Ability: Mold Breaker  
+Weezing-Galar (F) @ Heavy-Duty Boots  
+Ability: Neutralizing Gas  
 Tera Type: Ghost  
-EVs: 240 HP / 36 Atk / 232 Spe  
-Jolly Nature  
-- Stealth Rock  
-- Gigaton Hammer  
-- Encore  
-- Thunder Wave  
+EVs: 252 HP / 252 Def / 4 SpD  
+Bold Nature  
+IVs: 0 Atk  
+- Toxic Spikes  
+- Will-O-Wisp  
+- Pain Split  
+- Defog  
 
-Dragonite (F) @ Lum Berry  
-Ability: Multiscale  
-Tera Type: Flying  
-EVs: 252 Atk / 4 SpD / 252 Spe  
-Jolly Nature  
-- Dragon Dance  
-- Tera Blast  
-- Earthquake  
-- Extreme Speed  
-
-Landorus-Therian @ Rocky Helmet  
-Ability: Intimidate  
-Tera Type: Ghost  
-EVs: 240 HP / 64 Def / 156 SpD / 48 Spe  
-Jolly Nature  
-- Earthquake  
-- U-turn  
-- Stealth Rock  
-- Taunt  
-
-Gholdengo @ Metal Coat  
-Ability: Good as Gold  
+Iron Crown @ Choice Specs  
+Ability: Quark Drive  
 Tera Type: Steel  
-EVs: 120 HP / 192 SpA / 196 Spe  
-Modest Nature  
-IVs: 0 Atk  
-- Nasty Plot  
-- Make It Rain  
-- Recover  
-- Thunderbolt  
-
-Hatterene @ Assault Vest  
-Ability: Magic Bounce  
-Tera Type: Water  
-EVs: 248 HP / 80 SpA / 120 SpD / 60 Spe  
-Modest Nature  
-IVs: 0 Atk  
+EVs: 4 Def / 252 SpA / 252 Spe  
+Timid Nature  
+IVs: 20 Atk  
+- Tachyon Cutter  
 - Psyshock  
-- Draining Kiss  
-- Mystical Fire  
-- Psychic Noise  
+- Focus Blast  
+- Volt Switch  
 
-Ninetales-Alola @ Light Clay  
-Ability: Snow Warning  
-Tera Type: Poison  
-EVs: 248 HP / 8 SpA / 252 Spe  
+Zapdos @ Heavy-Duty Boots  
+Ability: Static  
+Tera Type: Fairy  
+EVs: 40 HP / 252 SpA / 216 Spe  
 Timid Nature  
 IVs: 0 Atk  
-- Aurora Veil  
-- Freeze-Dry  
-- Encore  
-- Roar  
-
-Ceruledge @ Covert Cloak  
-Ability: Flash Fire  
-Tera Type: Bug  
-EVs: 248 HP / 60 Def / 116 SpD / 84 Spe  
-Careful Nature  
-- Bulk Up  
-- Bitter Blade  
-- Shadow Sneak  
-- Taunt  
-
-Gliscor (M) @ Toxic Orb  
-Ability: Poison Heal  
-Tera Type: Normal  
-EVs: 244 HP / 20 Atk / 36 Def / 112 SpD / 96 Spe  
-Jolly Nature  
-- Swords Dance  
-- Facade  
-- Earthquake  
-- Agility  
+- Volt Switch  
+- Hurricane  
+- Heat Wave  
+- Roost  
 """
 
 
@@ -145,35 +73,33 @@ pokemons = team.strip().split('\n\n')
 
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
-        custom_teambuilder = RandomTeamFromPool(pokemons)
-        print(f"Custom team: {custom_teambuilder.yield_team()}")
-        super().__init__(team=custom_teambuilder, *args, **kwargs)
+        super().__init__(team=team, *args, **kwargs)
 
     def choose_move(self, battle: AbstractBattle):
+        my_pokemon = battle.active_pokemon
+
+        # If you're low on HP
+        if my_pokemon.current_hp_fraction < 0.25:
+            # Try to heal if a healing move is available
+            healing_moves = {"roost", "recover", "morning sun", "moonlight", "slack off", "milk drink", "soft-boiled"}
+            for move in battle.available_moves:
+                if move.id in healing_moves:
+                    return self.create_order(move)
+
+            # Otherwise, switch to the healthiest available teammate
+            if battle.available_switches:
+                best_switch = max(battle.available_switches, key=lambda p: p.current_hp_fraction)
+                return self.create_order(best_switch)
+
+        # Default: use strongest available move
         if battle.available_moves:
             best_move = max(battle.available_moves, key=lambda move: move.base_power or 0)
-            # Creating an order for the selected move
             return self.create_order(best_move)
-        elif battle.available_switches:
-            # If no moves are available, switch to the first available Pokémon
+
+        # Fallback: switch to anything
+        if battle.available_switches:
             return self.create_order(battle.available_switches[0])
-        
+
         return self.choose_random_move(battle)
+
         
-
-
-class RandomTeamFromPool(Teambuilder):
-    def __init__(self, pokemons):
-        self.pokemons = []
-
-        for pokemon in pokemons:
-            parsed = self.parse_showdown_team(pokemon)
-            self.pokemons.append(parsed[0])  # Each 'parsed' is a list of 1 mon
-
-        self.n_pokemons = len(self.pokemons)
-        assert self.n_pokemons >= 6
-
-    def yield_team(self):
-        idxs = np.random.choice(self.n_pokemons, 6, replace=False)
-        team = [self.pokemons[i] for i in idxs]
-        return self.join_team(team)
