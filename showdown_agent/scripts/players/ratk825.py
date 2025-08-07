@@ -80,7 +80,7 @@ class CustomAgent(Player):
         my_pokemon = battle.active_pokemon
         opp_pokemon = battle.opponent_active_pokemon
 
-        def move_damage_estimation(move , attacker, defender):
+        def move_damage_estimate(move, attacker, defender):
             if not move.base_power or not move.type:
                 return 0
 
@@ -91,30 +91,75 @@ class CustomAgent(Player):
 
             stab = 1.5 if move.type in {attacker.type_1, attacker.type_2} else 1.0
             accuracy = move.accuracy / 100 if move.accuracy else 1.0
+
             return move.base_power * stab * effectiveness * accuracy
 
-        def evaluate_state(my_move: Move):
-                if not opp_pokemon or not my_move:
-                    return 0
+        def score_state(my_dmg, opp_dmg, my_hp, opp_hp):
+            return (
+                    3 * my_dmg
+                    - 2 * opp_dmg
+                    + 1.5 * my_hp
+                    - 0.5 * opp_hp
+            )
 
-                my_dmg = move_damage_estimation(my_move, my_pokemon, opp_pokemon)
+        def simulate_move_outcome(my_move):
+            if not opp_pokemon or not my_move:
+                return 0
 
-                if not opp_pokemon.moves:
-                    return my_dmg  # assume no counterplay
+            my_dmg = move_damage_estimate(my_move, my_pokemon, opp_pokemon)
 
-                worst_case_dmg = max(
-                    (move_damage_estimation(opp_move, opp_pokemon, my_pokemon) for opp_move in
-                     opp_pokemon.moves.values()),
-                    default=0
-                )
+            if not opp_pokemon.moves:
+                return score_state(my_dmg, 0, my_pokemon.current_hp_fraction, opp_pokemon.current_hp_fraction)
 
-                return my_dmg - worst_case_dmg
+            worst_case_dmg = max(
+                (move_damage_estimate(opp_move, opp_pokemon, my_pokemon) for opp_move in opp_pokemon.moves.values()),
+                default=0
+            )
 
-        if battle.available_moves:
-            best_move = max(battle.available_moves, key=evaluate_state)
-            return self.create_order(best_move)
+            if my_dmg >= opp_pokemon.current_hp:
+                faint_bonus = 2.0
+            else:
+                faint_bonus = 0.0
 
-        if battle.available_switches:
-            return self.create_order(max(battle.available_switches, key=lambda p: p.current_hp_fraction))
+            return score_state(my_dmg, worst_case_dmg, my_pokemon.current_hp_fraction,
+                               opp_pokemon.current_hp_fraction) + faint_bonus
+
+        def simulate_switch_outcome(switch_in):
+            if not opp_pokemon:
+                return 0
+
+            if not opp_pokemon.moves:
+                return switch_in.current_hp_fraction
+
+            worst_case_dmg = max(
+                (move_damage_estimate(opp_move, opp_pokemon, switch_in) for opp_move in opp_pokemon.moves.values()),
+                default=0
+            )
+
+            if worst_case_dmg >= switch_in.current_hp:
+                return -5
+
+                # Assume switch takes a hit and does nothing in return
+            return score_state(0, worst_case_dmg, switch_in.current_hp_fraction, opp_pokemon.current_hp_fraction)
+
+        best_action = None
+        best_score = float('-inf')
+
+        # Evaluate moves
+        for move in battle.available_moves:
+            score = simulate_move_outcome(move)
+            if score > best_score:
+                best_score = score
+                best_action = self.create_order(move)
+
+        # Evaluate switches
+        for switch in battle.available_switches:
+            score = simulate_switch_outcome(switch)
+            if score > best_score:
+                best_score = score
+                best_action = self.create_order(switch)
+
+        if best_action:
+            return best_action
 
         return self.choose_random_move(battle)
