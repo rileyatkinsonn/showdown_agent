@@ -1,5 +1,6 @@
-from poke_env.battle import AbstractBattle
+from poke_env.battle import AbstractBattle, Move
 from poke_env.player import Player
+
 import numpy as np
 from poke_env.teambuilder import Teambuilder
 
@@ -77,46 +78,43 @@ class CustomAgent(Player):
 
     def choose_move(self, battle: AbstractBattle):
         my_pokemon = battle.active_pokemon
+        opp_pokemon = battle.opponent_active_pokemon
 
-        if my_pokemon.fainted:
-            if battle.available_switches:
-                return self.create_order(battle.available_switches[0])
-            return self.choose_random_move(battle)
+        def move_damage_estimation(move , attacker, defender):
+            if not move.base_power or not move.type:
+                return 0
 
-        if my_pokemon.status in {"slp", "frz"}:
-            if battle.available_switches:
-                best_switch = max(battle.available_switches, key=lambda p: p.current_hp_fraction)
-                return self.create_order(best_switch)
+            try:
+                effectiveness = move.type.damage_multiplier(defender.type_1, defender.type_2)
+            except Exception:
+                effectiveness = 1.0
 
-        if my_pokemon.current_hp_fraction < 0.25:
-            healing_moves = {"roost", "recover", "morningsun", "moonlight", "slackoff", "milkdrink", "softboiled"}
-            for move in battle.available_moves:
-                if move.id in healing_moves:
-                    return self.create_order(move)
-            if battle.available_switches:
-                best_switch = max(battle.available_switches, key=lambda p: p.current_hp_fraction)
-                return self.create_order(best_switch)
+            stab = 1.5 if move.type in {attacker.type_1, attacker.type_2} else 1.0
+            accuracy = move.accuracy / 100 if move.accuracy else 1.0
+            return move.base_power * stab * effectiveness * accuracy
+
+        def evaluate_state(my_move: Move):
+                if not opp_pokemon or not my_move:
+                    return 0
+
+                my_dmg = move_damage_estimation(my_move, my_pokemon, opp_pokemon)
+
+                if not opp_pokemon.moves:
+                    return my_dmg  # assume no counterplay
+
+                worst_case_dmg = max(
+                    (move_damage_estimation(opp_move, opp_pokemon, my_pokemon) for opp_move in
+                     opp_pokemon.moves.values()),
+                    default=0
+                )
+
+                return my_dmg - worst_case_dmg
 
         if battle.available_moves:
-            opponent = battle.opponent_active_pokemon
-
-            def move_score(move):
-                if not move.base_power or not move.type or not opponent:
-                    return 0
-                try:
-                    multiplier = move.type.damage_multiplier(*opponent.types, type_chart=move._type_chart)
-                except Exception:
-                    multiplier = 1.0
-                stab = 1.5 if move.type in {my_pokemon.type_1, my_pokemon.type_2} else 1.0
-                return move.base_power * multiplier * stab
-
-            best_move = max(battle.available_moves, key=move_score)
-
-            if battle.can_tera:
-                return self.create_order(best_move, terastallize=True)
+            best_move = max(battle.available_moves, key=evaluate_state)
             return self.create_order(best_move)
 
         if battle.available_switches:
-            return self.create_order(battle.available_switches[0])
+            return self.create_order(max(battle.available_switches, key=lambda p: p.current_hp_fraction))
 
         return self.choose_random_move(battle)
