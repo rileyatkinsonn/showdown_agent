@@ -1,72 +1,75 @@
 from poke_env.battle import AbstractBattle, Move
 from poke_env.player import Player
+from poke_env.data import GenData
 
 import numpy as np
 from poke_env.teambuilder import Teambuilder
 
 team = """
-Dragapult @ Heavy-Duty Boots  
-Ability: Cursed Body  
-Tera Type: Dragon  
-EVs: 60 Atk / 196 SpA / 252 Spe  
-Naive Nature  
-- Dragon Darts  
-- Hex  
-- Will-O-Wisp  
-- U-turn  
 
-Dragonite (F) @ Heavy-Duty Boots  
-Ability: Multiscale  
-Tera Type: Normal  
-EVs: 104 HP / 252 Atk / 152 Spe  
-Adamant Nature  
-- Dragon Dance  
-- Earthquake  
-- Extreme Speed  
-- Roost  
 
-Ting-Lu @ Leftovers  
-Ability: Vessel of Ruin  
-Tera Type: Water  
-EVs: 248 HP / 252 SpD / 8 Spe  
-Careful Nature  
-- Stealth Rock  
-- Ruination  
-- Earthquake  
-- Whirlwind  
-
-Weezing-Galar (F) @ Heavy-Duty Boots  
-Ability: Neutralizing Gas  
+Deoxys-Speed @ Focus Sash  
+Ability: Pressure  
 Tera Type: Ghost  
-EVs: 252 HP / 252 Def / 4 SpD  
+EVs: 248 HP / 8 SpA / 252 Spe  
+Timid Nature  
+IVs: 0 Atk  
+- Thunder Wave  
+- Spikes  
+- Taunt  
+- Psycho Boost  
+
+Kingambit @ Dread Plate  
+Ability: Supreme Overlord  
+Tera Type: Dark  
+EVs: 56 HP / 252 Atk / 200 Spe  
+Adamant Nature  
+- Swords Dance  
+- Kowtow Cleave  
+- Iron Head  
+- Sucker Punch  
+
+Zacian-Crowned @ Rusted Sword  
+Ability: Intrepid Sword  
+Tera Type: Flying  
+EVs: 252 Atk / 4 SpD / 252 Spe  
+Jolly Nature  
+- Swords Dance  
+- Behemoth Blade  
+- Close Combat  
+- Wild Charge  
+
+Arceus-Fairy @ Pixie Plate  
+Ability: Multitype  
+Tera Type: Fire  
+EVs: 248 HP / 72 Def / 188 Spe  
 Bold Nature  
 IVs: 0 Atk  
-- Toxic Spikes  
-- Will-O-Wisp  
-- Pain Split  
-- Defog  
+- Calm Mind  
+- Judgment  
+- Taunt  
+- Recover  
 
-Iron Crown @ Choice Specs  
-Ability: Quark Drive  
-Tera Type: Steel  
-EVs: 4 Def / 252 SpA / 252 Spe  
-Timid Nature  
-IVs: 20 Atk  
-- Tachyon Cutter  
-- Psyshock  
-- Focus Blast  
-- Volt Switch  
-
-Zapdos @ Heavy-Duty Boots  
-Ability: Static  
-Tera Type: Fairy  
-EVs: 40 HP / 252 SpA / 216 Spe  
-Timid Nature  
+Eternatus @ Power Herb  
+Ability: Pressure  
+Tera Type: Fire  
+EVs: 124 HP / 252 SpA / 132 Spe  
+Modest Nature  
 IVs: 0 Atk  
-- Volt Switch  
-- Hurricane  
-- Heat Wave  
-- Roost  
+- Agility  
+- Meteor Beam  
+- Dynamax Cannon  
+- Fire Blast  
+
+Koraidon @ Life Orb  
+Ability: Orichalcum Pulse  
+Tera Type: Fire  
+EVs: 8 HP / 248 Atk / 252 Spe  
+Jolly Nature  
+- Swords Dance  
+- Scale Shot  
+- Flame Charge  
+- Close Combat  
 """
 
 
@@ -77,89 +80,80 @@ class CustomAgent(Player):
         super().__init__(team=team, *args, **kwargs)
 
     def choose_move(self, battle: AbstractBattle):
+        gen_data = GenData.from_format(battle.format)
         my_pokemon = battle.active_pokemon
         opp_pokemon = battle.opponent_active_pokemon
 
-        def move_damage_estimate(move, attacker, defender):
-            if not move.base_power or not move.type:
+        def move_score(move):
+            move_info = gen_data.moves.get(move.id, {})
+            if not move_info:
                 return 0
+            base_power = move_info.get("basePower", move.base_power or 0)
+            accuracy = move_info.get("accuracy", move.accuracy or 100)
+            category = move_info.get("category", "Status")
 
+            score = 0
+
+            # STAB
+            if move.type in {my_pokemon.type_1, my_pokemon.type_2}:
+                base_power *= 1.5
+
+            # Type effectiveness
             try:
-                effectiveness = move.type.damage_multiplier(defender.type_1, defender.type_2)
+                effectiveness = move.type.damage_multiplier(
+                    opp_pokemon.type_1, opp_pokemon.type_2
+                )
             except Exception:
                 effectiveness = 1.0
+            base_power *= effectiveness
 
-            stab = 1.5 if move.type in {attacker.type_1, attacker.type_2} else 1.0
-            accuracy = move.accuracy / 100 if move.accuracy else 1.0
+            # Accuracy factor
+            score += base_power * (accuracy / 100)
 
-            return move.base_power * stab * effectiveness * accuracy
+            # Bonuses for status/utility
+            if category == "Status":
+                if move.id in {"stealthrock", "toxicspikes", "willowisp", "defog"}:
+                    score += 20
+                if move.id in {"roost", "painsplit"}:
+                    score += 10
 
-        def score_state(my_dmg, opp_dmg, my_hp, opp_hp):
-            return (
-                    3 * my_dmg
-                    - 2 * opp_dmg
-                    + 1.5 * my_hp
-                    - 0.5 * opp_hp
-            )
+            if move.id in {"uturn", "voltswitch"}:
+                score += 15
 
-        def simulate_move_outcome(my_move):
-            if not opp_pokemon or not my_move:
-                return 0
+            if move.priority > 0:
+                score += 10
 
-            my_dmg = move_damage_estimate(my_move, my_pokemon, opp_pokemon)
+            return score
 
-            if not opp_pokemon.moves:
-                return score_state(my_dmg, 0, my_pokemon.current_hp_fraction, opp_pokemon.current_hp_fraction)
-
-            worst_case_dmg = max(
-                (move_damage_estimate(opp_move, opp_pokemon, my_pokemon) for opp_move in opp_pokemon.moves.values()),
-                default=0
-            )
-
-            if my_dmg >= opp_pokemon.current_hp:
-                faint_bonus = 2.0
-            else:
-                faint_bonus = 0.0
-
-            return score_state(my_dmg, worst_case_dmg, my_pokemon.current_hp_fraction,
-                               opp_pokemon.current_hp_fraction) + faint_bonus
-
-        def simulate_switch_outcome(switch_in):
-            if not opp_pokemon:
-                return 0
-
-            if not opp_pokemon.moves:
-                return switch_in.current_hp_fraction
-
-            worst_case_dmg = max(
-                (move_damage_estimate(opp_move, opp_pokemon, switch_in) for opp_move in opp_pokemon.moves.values()),
-                default=0
-            )
-
-            if worst_case_dmg >= switch_in.current_hp:
-                return -5
-
-                # Assume switch takes a hit and does nothing in return
-            return score_state(0, worst_case_dmg, switch_in.current_hp_fraction, opp_pokemon.current_hp_fraction)
+        def switch_score(switch):
+            score = 0
+            for move in opp_pokemon.moves.values():
+                try:
+                    effectiveness = move.type.damage_multiplier(
+                        switch.type_1, switch.type_2
+                    )
+                except Exception:
+                    effectiveness = 1.0
+                if effectiveness < 1:
+                    score += 10
+                elif effectiveness > 1:
+                    score -= 10
+            return score + (switch.current_hp_fraction * 10)
 
         best_action = None
         best_score = float('-inf')
 
-        # Evaluate moves
         for move in battle.available_moves:
-            score = simulate_move_outcome(move)
+            score = move_score(move)
             if score > best_score:
                 best_score = score
                 best_action = self.create_order(move)
 
-        # Evaluate switches
         for switch in battle.available_switches:
-            score = simulate_switch_outcome(switch)
+            score = switch_score(switch)
             if score > best_score:
                 best_score = score
                 best_action = self.create_order(switch)
 
-        if best_action:
-            return best_action
+        return best_action or self.choose_random_move(battle)
 
-        return self.choose_random_move(battle)
