@@ -98,6 +98,7 @@ class CustomAgent(Player):
         if my_pokemon is None or opp_pokemon is None:
             return self.choose_random_move(battle)
 
+        # ---------- your original scoring (kept) ----------
         def move_score(move):
             move_info = gen_data.moves.get(move.id, {})
             if not move_info:
@@ -106,14 +107,11 @@ class CustomAgent(Player):
             accuracy = _acc_to_pct(move_info.get("accuracy", move.accuracy))
             category = move_info.get("category", "Status")
 
-
             # Gate TWave into immunities / already statused
             if move.id == "thunderwave":
-                # don't try if target has a status already
                 if getattr(opp_pokemon, "status", None):
                     return -999
                 try:
-                    # Electric vs Ground = 0; Electric-types are immune to paralysis from electric moves
                     eff = move.type.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
                     if eff == 0 or (opp_pokemon.type_1 and opp_pokemon.type_1.name == "ELECTRIC") or \
                             (opp_pokemon.type_2 and opp_pokemon.type_2.name == "ELECTRIC"):
@@ -124,24 +122,24 @@ class CustomAgent(Player):
             score = 0
 
             # STAB
-            if move.type in {my_pokemon.type_1, my_pokemon.type_2}:
-                base_power *= 1.5
+            try:
+                if move.type in {my_pokemon.type_1, my_pokemon.type_2}:
+                    base_power *= 1.5
+            except Exception:
+                pass
 
             # Lightweight setup rule
             if move.id in {"swordsdance", "calmmind"}:
-                # Only when healthy and not obviously threatened
                 hp_ok = (my_pokemon.current_hp_fraction or 1.0) >= 0.7
-                # Rough check: if our best raw damaging move this turn is mediocre, setup instead
                 try:
                     best_dmg_now = 0.0
                     for m2 in battle.available_moves:
                         mi2 = gen_data.moves.get(m2.id, {})
                         bp2 = (mi2.get("basePower", m2.base_power or 0)) * (
                                     _acc_to_pct(mi2.get("accuracy", m2.accuracy)) / 100.0)
-                        # STAB + effectiveness
-                        if m2.type in {my_pokemon.type_1, my_pokemon.type_2}:
-                            bp2 *= 1.5
                         try:
+                            if m2.type in {my_pokemon.type_1, my_pokemon.type_2}:
+                                bp2 *= 1.5
                             bp2 *= m2.type.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
                         except Exception:
                             pass
@@ -153,9 +151,7 @@ class CustomAgent(Player):
 
             # Type effectiveness
             try:
-                effectiveness = move.type.damage_multiplier(
-                    opp_pokemon.type_1, opp_pokemon.type_2
-                )
+                effectiveness = move.type.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
             except Exception:
                 effectiveness = 1.0
             base_power *= effectiveness
@@ -178,7 +174,6 @@ class CustomAgent(Player):
 
             # Deoxys-Speed: early-game plan
             if my_pokemon.species and "Deoxys-Speed" in my_pokemon.species:
-                # prefer Spikes turn 1–3 if they have backups and we don't already have 2+ layers
                 if move.id == "spikes":
                     try:
                         opp_remaining = len(battle.opponent_team) - sum(
@@ -188,7 +183,6 @@ class CustomAgent(Player):
                             score += 40
                     except Exception:
                         pass
-                # prefer Taunt early to block their hazards/setup
                 if move.id == "taunt" and battle.turn <= 2:
                     score += 25
 
@@ -200,33 +194,137 @@ class CustomAgent(Player):
 
         def switch_score(switch):
             score = 0
-            for move in opp_pokemon.moves.values():
+            for mv in opp_pokemon.moves.values():
                 try:
-                    effectiveness = move.type.damage_multiplier(
-                        switch.type_1, switch.type_2
-                    )
+                    effectiveness = mv.type.damage_multiplier(switch.type_1, switch.type_2)
                 except Exception:
                     effectiveness = 1.0
                 if effectiveness < 1:
                     score += 10
                 elif effectiveness > 1:
                     score -= 10
-            return score + (switch.current_hp_fraction * 10)
+            hp_frac = switch.current_hp_fraction if switch.current_hp_fraction is not None else 1.0
+            return score + (hp_frac * 10)
 
+        # ---------- lightweight damage estimator for tree ----------
+        def dmg_est(attacker, defender, mv):
+            """Approx expected damage-like score for tree math (BP * acc * STAB * SE)."""
+            if attacker is None or defender is None or mv is None:
+                return 0.0
+            mi = gen_data.moves.get(mv.id, {})
+            bp = float(mv.base_power or mi.get("basePower") or 0.0)
+            if bp <= 0 or mi.get("category", "Status") == "Status":
+                return 0.0
+            acc = _acc_to_pct(mi.get("accuracy", mv.accuracy)) / 100.0
+            try:
+                stab = 1.5 if mv.type in {attacker.type_1, attacker.type_2} else 1.0
+            except Exception:
+                stab = 1.0
+            try:
+                eff = mv.type.damage_multiplier(defender.type_1, defender.type_2)
+            except Exception:
+                eff = 1.0
+            if eff == 0:
+                return 0.0
+            return bp * acc * stab * eff
+
+        def opp_best_move_damage(vs_defender):
+            """Best revealed opp damage into vs_defender; fallback to STAB proxy 80BP."""
+            best = 0.0
+            if getattr(opp_pokemon, "moves", None):
+                for mv in opp_pokemon.moves.values():
+                    best = max(best, dmg_est(opp_pokemon, vs_defender, mv))
+            if best == 0.0:
+                # STAB proxy
+                try:
+                    for t in (opp_pokemon.type_1, opp_pokemon.type_2):
+                        if not t:
+                            continue
+                        # base 80 * STAB * effectiveness
+                        eff = t.damage_multiplier(vs_defender.type_1, vs_defender.type_2)
+                        best = max(best, 80.0 * 1.5 * eff)
+                except Exception:
+                    pass
+            return best
+
+        def our_best_damage_next_turn(vs_defender):
+            best = 0.0
+            for mv in battle.available_moves:
+                best = max(best, dmg_est(my_pokemon, vs_defender, mv))
+            return best
+
+        # ---------- opponent bench for switch responses ----------
+        def opp_switch_targets():
+            bench = []
+            for p in battle.opponent_team.values():
+                if not p or p.fainted or p.active:
+                    continue
+                bench.append(p)
+            return bench
+
+        # ---------- depth-2 evaluation ----------
+        ALPHA = 1.0  # weight on opp damage
+        GAMMA = 0.8  # weight on next-turn value
+
+        def value_if_we_use_move(mv):
+            # Opp stays & attacks
+            our_immediate = move_score(mv)  # keep your heuristic value
+            opp_back = opp_best_move_damage(my_pokemon)
+            worst = our_immediate - ALPHA * opp_back
+
+            # Opp switches: they pick the one worst for us
+            for tgt in opp_switch_targets():
+                immediate_on_switch = dmg_est(my_pokemon, tgt, mv)  # our hit on the switch-in
+                our_next = our_best_damage_next_turn(tgt)
+                their_next = opp_best_move_damage(my_pokemon)  # rough: assume they hit our current mon
+                line_val = immediate_on_switch + GAMMA * (our_next - ALPHA * their_next)
+                worst = min(worst, line_val)
+
+            return worst
+
+        def value_if_we_switch(sw):
+            # They likely attack our switch-in
+            opp_free = opp_best_move_damage(sw)
+            our_next = 0.0
+            if getattr(sw, "moves", None):
+                for mv in sw.moves.values():
+                    our_next = max(our_next, dmg_est(sw, opp_pokemon, mv))
+            if our_next == 0.0:
+                # proxy: STAB 80 into current opp
+                try:
+                    for t in (sw.type_1, sw.type_2):
+                        if not t:
+                            continue
+                        eff = t.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
+                        our_next = max(our_next, 80.0 * 1.5 * eff)
+                except Exception:
+                    pass
+            hp_frac = sw.current_hp_fraction if sw.current_hp_fraction is not None else 1.0
+            return -ALPHA * opp_free + GAMMA * our_next + 5.0 * hp_frac
+
+        # ---------- true selection: argmax over our actions, opponent plays minimizer ----------
         best_action = None
-        best_score = float('-inf')
+        best_score = float("-inf")
 
-        for move in battle.available_moves:
-            score = move_score(move)
-            if score > best_score:
-                best_score = score
-                best_action = self.create_order(move)
+        # Evaluate our moves (skip immune damaging moves)
+        for mv in battle.available_moves:
+            mi = gen_data.moves.get(mv.id, {})
+            if mi.get("category", "Status") != "Status":
+                try:
+                    if mv.type.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2) == 0:
+                        continue
+                except Exception:
+                    pass
+            sc = value_if_we_use_move(mv)
+            if sc > best_score:
+                best_score = sc
+                best_action = self.create_order(mv)
 
-        for switch in battle.available_switches:
-            score = switch_score(switch)
-            if score > best_score:
-                best_score = score
-                best_action = self.create_order(switch)
+        # Evaluate our switches
+        for sw in battle.available_switches:
+            sc = value_if_we_switch(sw)
+            if sc > best_score:
+                best_score = sc
+                best_action = self.create_order(sw)
 
         return best_action or self.choose_random_move(battle)
-
