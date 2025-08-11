@@ -1,13 +1,10 @@
 from poke_env.battle import AbstractBattle, Move
 from poke_env.player import Player
 from poke_env.data import GenData
-
 import numpy as np
 from poke_env.teambuilder import Teambuilder
 
 team = """
-
-
 Deoxys-Speed @ Focus Sash  
 Ability: Pressure  
 Tera Type: Ghost  
@@ -72,11 +69,9 @@ Jolly Nature
 - Close Combat  
 """
 
-
 pokemons = team.strip().split('\n\n')
 
 def _acc_to_pct(acc) -> float:
-    # GenData accuracy can be bool, int, or None
     if acc is True:
         return 100.0
     if acc is False or acc is None:
@@ -101,32 +96,43 @@ class CustomAgent(Player):
         def move_score(move):
             move_info = gen_data.moves.get(move.id, {})
             if not move_info:
-                return -999
+                return -float('inf')
             base_power = move_info.get("basePower", move.base_power or 0)
             accuracy = _acc_to_pct(move_info.get("accuracy", move.accuracy))
             category = move_info.get("category", "Status")
 
-            # Early check for ineffective moves
+            # Robust type checking
+            effectiveness = 1.0
+            opp_types = []
             try:
-                effectiveness = move.type.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
-                if effectiveness == 0:
-                    return -999
+                if opp_pokemon.type_1 and opp_pokemon.type_1.name:
+                    opp_types.append(opp_pokemon.type_1.name)
+                if opp_pokemon.type_2 and opp_pokemon.type_2.name:
+                    opp_types.append(opp_pokemon.type_2.name)
+                if move.type and move.type.name:
+                    for t in opp_types:
+                        eff = move.type.damage_multiplier(t)
+                        effectiveness *= eff
+                    if effectiveness <= 0:
+                        return -float('inf')
             except Exception:
                 effectiveness = 1.0
 
             # Gate Thunder Wave
             if move.id == "thunderwave":
-                if getattr(opp_pokemon, "status", None):
-                    return -999
-                if effectiveness == 0 or (opp_pokemon.type_1 and opp_pokemon.type_1.name == "ELECTRIC") or \
-                        (opp_pokemon.type_2 and opp_pokemon.type_2.name == "ELECTRIC"):
-                    return -999
+                if getattr(opp_pokemon, "status", None) or "ELECTRIC" in opp_types:
+                    return -float('inf')
 
             score = 0
 
             # STAB
+            my_types = []
             try:
-                if move.type in {my_pokemon.type_1, my_pokemon.type_2}:
+                if my_pokemon.type_1:
+                    my_types.append(my_pokemon.type_1)
+                if my_pokemon.type_2:
+                    my_types.append(my_pokemon.type_2)
+                if move.type in my_types:
                     base_power *= 1.5
             except Exception:
                 pass
@@ -142,21 +148,23 @@ class CustomAgent(Player):
                     best_dmg_now = 0.0
                     for m2 in battle.available_moves:
                         mi2 = gen_data.moves.get(m2.id, {})
-                        bp2 = (mi2.get("basePower", m2.base_power or 0)) * (
-                                _acc_to_pct(mi2.get("accuracy", m2.accuracy)) / 100.0)
+                        bp2 = (mi2.get("basePower", m2.base_power or 0)) * (_acc_to_pct(mi2.get("accuracy", m2.accuracy)) / 100.0)
                         try:
-                            if m2.type in {my_pokemon.type_1, my_pokemon.type_2}:
+                            eff2 = 1.0
+                            for t in opp_types:
+                                eff2 *= m2.type.damage_multiplier(t)
+                            if m2.type in my_types:
                                 bp2 *= 1.5
                             if m2.type.name == "FIRE" and battle.weather.get("SunnyDay", 0):
                                 bp2 *= 1.5
-                            bp2 *= m2.type.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
+                            bp2 *= eff2
                         except Exception:
                             pass
                         best_dmg_now = max(best_dmg_now, bp2)
+                    if hp_ok and best_dmg_now < (getattr(opp_pokemon, "current_hp", 1) or 1) * 0.06:
+                        score += 140  # Higher setup priority
                 except Exception:
-                    best_dmg_now = 0.0
-                if hp_ok and best_dmg_now < (getattr(opp_pokemon, "current_hp", 1) or 1) * 0.35:
-                    score += 50  # Aggressive setup
+                    pass
 
             # Type effectiveness
             base_power *= effectiveness
@@ -164,87 +172,97 @@ class CustomAgent(Player):
 
             # Status/utility
             if category == "Status":
-                if move.id == "recover" and (my_pokemon.current_hp_fraction or 1.0) <= 0.65:  # Higher threshold
-                    score += 60  # High priority
+                if move.id == "recover" and (my_pokemon.current_hp_fraction or 1.0) <= 0.97:  # Higher threshold
+                    score += 150  # Higher priority
                 if move.id == "taunt":
                     try:
-                        if opp_pokemon.moves and any(
-                                m.id in {"swordsdance", "calmmind", "agility"} for m in opp_pokemon.moves.values()):
-                            score += 45
-                        elif battle.turn <= 3:
-                            score += 35
+                        if opp_pokemon.moves and any(m.id in {"swordsdance", "calmmind", "agility"} for m in opp_pokemon.moves.values()):
+                            score += 110
+                        elif battle.turn <= 9:
+                            score += 100
                     except Exception:
                         pass
                 if my_pokemon.status and move.id == "thunderwave":
-                    score -= 40
+                    score -= 110
 
             # Specific move priorities
             if my_pokemon.species and "Deoxys-Speed" in my_pokemon.species:
                 if move.id == "spikes":
                     try:
-                        opp_remaining = len(battle.opponent_team) - sum(
-                            p.fainted for p in battle.opponent_team.values())
+                        opp_remaining = len(battle.opponent_team) - sum(p.fainted for p in battle.opponent_team.values())
                         spikes_layers = battle.opponent_side_conditions.get("spikes", 0)
-                        if opp_remaining >= 2 and (not spikes_layers or spikes_layers < 3) and battle.turn <= 3:
-                            score += 60
+                        if opp_remaining >= 2 and (not spikes_layers or spikes_layers < 3) and battle.turn <= 10:
+                            score += 150  # Higher Spikes priority
                     except Exception:
                         pass
-                if move.id == "taunt" and battle.turn <= 2:
-                    score += 40
-                if move.id == "psychoboost" and (opp_pokemon.type_1 and opp_pokemon.type_1.name == "DARK" or \
-                                                 opp_pokemon.type_2 and opp_pokemon.type_2.name == "DARK"):
-                    return -999
+                if move.id == "taunt" and battle.turn <= 9:
+                    score += 105
+                if move.id == "psychoboost" and any(t in {"DARK", "FAIRY", "STEEL"} for t in opp_types):
+                    return -float('inf')
 
-            if my_pokemon.species and "Eternatus" in my_pokemon.species and move.id == "fireblast":
-                try:
-                    if opp_pokemon.type_1 and opp_pokemon.type_1.name == "FAIRY" or \
-                            opp_pokemon.type_2 and opp_pokemon.type_2.name == "FAIRY":
-                        score += 50
-                    if battle.weather.get("SunnyDay", 0):
-                        score += 30
-                except Exception:
-                    pass
+            if my_pokemon.species and "Eternatus" in my_pokemon.species:
+                if move.id == "fireblast":
+                    try:
+                        if "FAIRY" in opp_types or "STEEL" in opp_types:
+                            score += 120
+                        if battle.weather.get("SunnyDay", 0):
+                            score += 100
+                    except Exception:
+                        pass
+                if move.id == "dynamaxcannon" and any(t in {"FAIRY", "NORMAL"} for t in opp_types):
+                    return -float('inf')
 
             if my_pokemon.species and "Koraidon" in my_pokemon.species:
                 if move.id == "flamecharge":
                     try:
-                        if opp_pokemon.type_1 and opp_pokemon.type_1.name == "FAIRY" or \
-                                opp_pokemon.type_2 and opp_pokemon.type_2.name == "FAIRY":
-                            score += 50
+                        if "FAIRY" in opp_types or "STEEL" in opp_types:
+                            score += 120
                         if battle.weather.get("SunnyDay", 0):
-                            score += 30
+                            score += 100
                     except Exception:
                         pass
-                if move.id == "closecombat" and (opp_pokemon.type_1 and opp_pokemon.type_1.name == "DARK" or \
-                                                 opp_pokemon.type_2 and opp_pokemon.type_2.name == "DARK"):
+                if move.id == "closecombat":
+                    try:
+                        if any(t in {"FAIRY", "STEEL"} for t in opp_types):
+                            score -= 110  # Stronger penalty
+                        if "DARK" in opp_types:
+                            score += 110
+                    except Exception:
+                        pass
+
+            if move.id == "suckerpunch":
+                try:
+                    if any(t in {"FAIRY", "STEEL"} for t in opp_types):
+                        score -= 70  # Stronger penalty
+                    if (opp_pokemon.current_hp_fraction or 1.0) <= 0.06:
+                        last_move = battle.opponent_last_move
+                        if last_move and gen_data.moves.get(last_move.id, {}).get("category", "Status") != "Status":
+                            score += 100
+                        else:
+                            score += 50
+                    else:
+                        score += 30
+                except Exception:
                     score += 40
 
-            if move.id == "suckerpunch" and (opp_pokemon.current_hp_fraction or 1.0) <= 0.3:
-                try:
-                    last_move = battle.opponent_last_move
-                    if last_move and gen_data.moves.get(last_move.id, {}).get("category", "Status") != "Status":
-                        score += 35
-                    else:
-                        score += 10
-                except Exception:
-                    score += 20
-
-            if move.priority > 0 or (move.id == "wildcharge" and opp_pokemon.moves and any(
-                    m.priority > 0 for m in opp_pokemon.moves.values())):
-                score += 25
+            if move.priority > 0 or (move.id == "wildcharge" and opp_pokemon.moves and any(m.priority > 0 for m in opp_pokemon.moves.values())):
+                score += 70
 
             # Hazard penalty
             try:
-                if (battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get(
-                        "spikes", 0)) and \
-                        (my_pokemon.current_hp_fraction or 1.0) <= 0.5 and move.id != "recover":
-                    score -= 30
+                if (battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get("spikes", 0)) and \
+                   (my_pokemon.current_hp_fraction or 1.0) <= 0.5 and move.id != "recover":
+                    score -= 90
             except Exception:
                 pass
 
             # Boost for high-damage moves
             if base_power >= 100 and effectiveness >= 1:
-                score += 20
+                score += 60
+
+            # Penalize low-accuracy moves
+            if accuracy < 90 and category != "Status":
+                score -= 50
 
             return score
 
@@ -252,44 +270,41 @@ class CustomAgent(Player):
             score = 0
             try:
                 for mv in opp_pokemon.moves.values():
-                    effectiveness = mv.type.damage_multiplier(switch.type_1, switch.type_2)
-                    if effectiveness < 1:
-                        score += 25
-                    elif effectiveness > 1:
-                        score -= 25
+                    eff = mv.type.damage_multiplier(switch.type_1, switch.type_2) if mv.type and switch.type_1 else 1.0
+                    if eff < 1:
+                        score += 80
+                    elif eff > 1:
+                        score -= 80
             except Exception:
                 pass
             hp_frac = switch.current_hp_fraction if switch.current_hp_fraction is not None else 1.0
             try:
-                if battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get(
-                        "spikes", 0):
-                    score += hp_frac * 35
+                if battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get("spikes", 0):
+                    score += hp_frac * 100
             except Exception:
                 pass
             # Mirror match matchups
-            if switch.species:
-                try:
-                    if switch.species == "Eternatus" and (opp_pokemon.type_1 and opp_pokemon.type_1.name == "FAIRY" or \
-                                                          opp_pokemon.type_2 and opp_pokemon.type_2.name == "FAIRY"):
-                        score += 50
-                    if switch.species == "Koraidon" and (opp_pokemon.type_1 and opp_pokemon.type_1.name == "DARK" or \
-                                                         opp_pokemon.type_2 and opp_pokemon.type_2.name == "DARK"):
-                        score += 50
-                    if switch.species == "Kingambit" and (opp_pokemon.type_1 and opp_pokemon.type_1.name == "STEEL" or \
-                                                          opp_pokemon.type_2 and opp_pokemon.type_2.name == "STEEL"):
-                        score += 40
-                    if switch.species == "Arceus-Fairy" and (
-                            opp_pokemon.type_1 and opp_pokemon.type_1.name == "DRAGON" or \
-                            opp_pokemon.type_2 and opp_pokemon.type_2.name == "DRAGON"):
-                        score += 40
-                except Exception:
-                    pass
+            try:
+                opp_types = []
+                if opp_pokemon.type_1 and opp_pokemon.type_1.name:
+                    opp_types.append(opp_pokemon.type_1.name)
+                if opp_pokemon.type_2 and opp_pokemon.type_2.name:
+                    opp_types.append(opp_pokemon.type_2.name)
+                if switch.species == "Eternatus" and any(t in {"FAIRY", "STEEL"} for t in opp_types):
+                    score += 120
+                if switch.species == "Koraidon" and "DARK" in opp_types:
+                    score += 120
+                if switch.species == "Kingambit" and any(t in {"FAIRY", "STEEL"} for t in opp_types):
+                    score += 110
+                if switch.species == "Arceus-Fairy" and any(t in {"DRAGON", "FIGHTING"} for t in opp_types):
+                    score += 110
+            except Exception:
+                pass
             if battle.weather.get("SunnyDay", 0) and switch.species in ["Eternatus", "Koraidon"]:
-                score += 30
-            # Account for stat boosts
+                score += 100
             if switch.species in ["Zacian-Crowned", "Kingambit"]:
-                score += 15  # Intrepid Sword, Supreme Overlord
-            return score + (hp_frac * 25)
+                score += 50
+            return score + (hp_frac * 80)
 
         def dmg_est(attacker, defender, mv):
             if attacker is None or defender is None or mv is None:
@@ -303,18 +318,21 @@ class CustomAgent(Player):
                 stab = 1.5 if mv.type in {attacker.type_1, attacker.type_2} else 1.0
                 if mv.type.name == "FIRE" and battle.weather.get("SunnyDay", 0):
                     stab *= 1.5
-                eff = mv.type.damage_multiplier(defender.type_1, defender.type_2)
+                eff = mv.type.damage_multiplier(defender.type_1, defender.type_2) if mv.type and defender.type_1 else 1.0
                 if eff == 0:
                     return 0.0
             except Exception:
                 stab = 1.0
                 eff = 1.0
-            # Boost for stat-enhancing abilities
             boost = 1.0
             if attacker.species == "Zacian-Crowned" and mv.category == "Physical":
-                boost *= 1.3  # Intrepid Sword
+                boost *= 1.3
             if attacker.species == "Kingambit" and mv.category == "Physical":
-                boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.team.values())  # Supreme Overlord
+                boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.team.values())
+            if defender.species == "Zacian-Crowned" and mv.category == "Physical":
+                boost /= 1.3
+            if defender.species == "Kingambit" and mv.category == "Physical":
+                boost /= 1.2 + 0.1 * sum(p.fainted for p in battle.opponent_team.values())
             return bp * acc * stab * eff * boost
 
         def opp_best_move_damage(vs_defender):
@@ -327,13 +345,13 @@ class CustomAgent(Player):
                     for t in (opp_pokemon.type_1, opp_pokemon.type_2):
                         if not t:
                             continue
-                        eff = t.damage_multiplier(vs_defender.type_1, vs_defender.type_2)
+                        eff = t.damage_multiplier(vs_defender.type_1, vs_defender.type_2) if vs_defender.type_1 else 1.0
                         boost = 1.0
                         if opp_pokemon.species == "Zacian-Crowned":
                             boost *= 1.3
                         if opp_pokemon.species == "Kingambit":
                             boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.opponent_team.values())
-                        best = max(best, 120.0 * 1.5 * eff * boost)
+                        best = max(best, 180.0 * 1.5 * eff * boost)
                 except Exception:
                     pass
             return best
@@ -352,8 +370,8 @@ class CustomAgent(Player):
                 bench.append(p)
             return bench
 
-        ALPHA = 1.2  # Increased to prioritize defense
-        GAMMA = 0.7  # Reduced to focus on immediate impact
+        ALPHA = 2.0  # Stronger defensive focus
+        GAMMA = 0.2  # Focus on immediate impact
 
         def value_if_we_use_move(mv):
             our_immediate = move_score(mv)
@@ -378,17 +396,17 @@ class CustomAgent(Player):
                     for t in (sw.type_1, sw.type_2):
                         if not t:
                             continue
-                        eff = t.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2)
+                        eff = t.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2) if opp_pokemon.type_1 else 1.0
                         boost = 1.0
                         if sw.species == "Zacian-Crowned":
                             boost *= 1.3
                         if sw.species == "Kingambit":
                             boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.team.values())
-                        our_next = max(our_next, 120.0 * 1.5 * eff * boost)
+                        our_next = max(our_next, 180.0 * 1.5 * eff * boost)
                 except Exception:
                     pass
             hp_frac = sw.current_hp_fraction if sw.current_hp_fraction is not None else 1.0
-            return -ALPHA * opp_free + GAMMA * our_next + 5.0 * hp_frac
+            return -ALPHA * opp_free + GAMMA * our_next + 15.0 * hp_frac
 
         best_action = None
         best_score = float("-inf")
