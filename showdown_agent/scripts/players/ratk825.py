@@ -71,6 +71,7 @@ Jolly Nature
 
 pokemons = team.strip().split('\n\n')
 
+
 def _acc_to_pct(acc) -> float:
     if acc is True:
         return 100.0
@@ -80,6 +81,7 @@ def _acc_to_pct(acc) -> float:
         return float(acc)
     except Exception:
         return 100.0
+
 
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
@@ -93,22 +95,36 @@ class CustomAgent(Player):
         if my_pokemon is None or opp_pokemon is None:
             return self.choose_random_move(battle)
 
+        def get_pokemon_types(pokemon):
+            """Get types as strings for a pokemon"""
+            types = []
+            try:
+                if pokemon.type_1 and hasattr(pokemon.type_1, 'name'):
+                    types.append(pokemon.type_1.name)
+                if pokemon.type_2 and hasattr(pokemon.type_2, 'name'):
+                    types.append(pokemon.type_2.name)
+            except:
+                pass
+            return types
+
+        def is_mirror_match():
+            """Check if we're in a mirror match (same team)"""
+            return battle.teampreview_opponent_team is not None and len(battle.teampreview_opponent_team) == 6
+
         def move_score(move):
             move_info = gen_data.moves.get(move.id, {})
             if not move_info:
                 return -float('inf')
+
             base_power = move_info.get("basePower", move.base_power or 0)
             accuracy = _acc_to_pct(move_info.get("accuracy", move.accuracy))
             category = move_info.get("category", "Status")
 
-            # Robust type checking
+            # Type effectiveness calculation
             effectiveness = 1.0
-            opp_types = []
+            opp_types = get_pokemon_types(opp_pokemon)
+
             try:
-                if opp_pokemon.type_1 and opp_pokemon.type_1.name:
-                    opp_types.append(opp_pokemon.type_1.name)
-                if opp_pokemon.type_2 and opp_pokemon.type_2.name:
-                    opp_types.append(opp_pokemon.type_2.name)
                 if move.type and move.type.name:
                     for t in opp_types:
                         eff = move.type.damage_multiplier(t)
@@ -118,14 +134,21 @@ class CustomAgent(Player):
             except Exception:
                 effectiveness = 1.0
 
-            # Gate Thunder Wave
-            if move.id == "thunderwave":
-                if getattr(opp_pokemon, "status", None) or "ELECTRIC" in opp_types:
-                    return -float('inf')
+            # Gate obviously bad moves early
+            if move.id == "thunderwave" and (getattr(opp_pokemon, "status", None) or "ELECTRIC" in opp_types):
+                return -float('inf')
+
+            # CRITICAL FIX: Don't use Dynamax Cannon against Fairy types
+            if move.id == "dynamaxcannon" and "FAIRY" in opp_types:
+                return -float('inf')
+
+            # CRITICAL FIX: Don't use Psycho Boost against Steel types
+            if move.id == "psychoboost" and "STEEL" in opp_types:
+                return -float('inf')
 
             score = 0
 
-            # STAB
+            # STAB calculation
             my_types = []
             try:
                 if my_pokemon.type_1:
@@ -137,290 +160,196 @@ class CustomAgent(Player):
             except Exception:
                 pass
 
-            # Sun boost
-            if move.type.name == "FIRE" and battle.weather.get("SunnyDay", 0):
-                base_power *= 1.5
+            # Weather boost
+            if move.type and move.type.name == "FIRE" and hasattr(battle, 'weather') and battle.weather:
+                if any("sun" in str(w).lower() for w in battle.weather):
+                    base_power *= 1.5
 
-            # Setup rule
+            # Mirror match specific logic
+            if is_mirror_match():
+                # In mirror matches, prioritize setup and defensive plays early
+                if battle.turn <= 3:
+                    if move.id in {"swordsdance", "calmmind", "agility"} and (
+                            my_pokemon.current_hp_fraction or 1.0) >= 0.7:
+                        score += 200
+                    if move.id == "recover" and (my_pokemon.current_hp_fraction or 1.0) <= 0.8:
+                        score += 180
+
+                # Prioritize Taunt to prevent opponent setup
+                if move.id == "taunt" and battle.turn <= 5:
+                    score += 160
+
+                # Speed control with Thunder Wave
+                if move.id == "thunderwave" and not getattr(opp_pokemon, "status", None):
+                    score += 140
+
+            # Setup move logic - more conservative
             if move.id in {"swordsdance", "calmmind", "agility"}:
-                hp_ok = (my_pokemon.current_hp_fraction or 1.0) >= 0.5
-                try:
-                    best_dmg_now = 0.0
-                    for m2 in battle.available_moves:
-                        mi2 = gen_data.moves.get(m2.id, {})
-                        bp2 = (mi2.get("basePower", m2.base_power or 0)) * (_acc_to_pct(mi2.get("accuracy", m2.accuracy)) / 100.0)
-                        try:
-                            eff2 = 1.0
-                            for t in opp_types:
-                                eff2 *= m2.type.damage_multiplier(t)
-                            if m2.type in my_types:
-                                bp2 *= 1.5
-                            if m2.type.name == "FIRE" and battle.weather.get("SunnyDay", 0):
-                                bp2 *= 1.5
-                            bp2 *= eff2
-                        except Exception:
-                            pass
-                        best_dmg_now = max(best_dmg_now, bp2)
-                    if hp_ok and best_dmg_now < (getattr(opp_pokemon, "current_hp", 1) or 1) * 0.06:
-                        score += 140  # Higher setup priority
-                except Exception:
-                    pass
+                hp_threshold = 0.7 if is_mirror_match() else 0.5
+                if (my_pokemon.current_hp_fraction or 1.0) >= hp_threshold:
+                    # Check if we have time to setup
+                    try:
+                        predicted_damage = 0
+                        if hasattr(opp_pokemon, 'moves') and opp_pokemon.moves:
+                            for opp_move in opp_pokemon.moves.values():
+                                if opp_move.base_power and opp_move.base_power > predicted_damage:
+                                    predicted_damage = opp_move.base_power
 
-            # Type effectiveness
+                        # Only setup if we won't be KO'd next turn
+                        if predicted_damage < (my_pokemon.current_hp_fraction or 1.0) * 300:
+                            score += 150
+                    except Exception:
+                        score += 100
+
+            # Core damage calculation
             base_power *= effectiveness
             score += base_power * (accuracy / 100)
 
-            # Status/utility
+            # Status move improvements
             if category == "Status":
-                if move.id == "recover" and (my_pokemon.current_hp_fraction or 1.0) <= 0.97:  # Higher threshold
-                    score += 150  # Higher priority
+                if move.id == "recover":
+                    hp_frac = my_pokemon.current_hp_fraction or 1.0
+                    if hp_frac <= 0.5:
+                        score += 200
+                    elif hp_frac <= 0.8:
+                        score += 120
+
                 if move.id == "taunt":
+                    # Higher priority early game and against setup threats
+                    if battle.turn <= 8:
+                        score += 130
                     try:
-                        if opp_pokemon.moves and any(m.id in {"swordsdance", "calmmind", "agility"} for m in opp_pokemon.moves.values()):
-                            score += 110
-                        elif battle.turn <= 9:
-                            score += 100
-                    except Exception:
-                        pass
-                if my_pokemon.status and move.id == "thunderwave":
-                    score -= 110
-
-            # Specific move priorities
-            if my_pokemon.species and "Deoxys-Speed" in my_pokemon.species:
-                if move.id == "spikes":
-                    try:
-                        opp_remaining = len(battle.opponent_team) - sum(p.fainted for p in battle.opponent_team.values())
-                        spikes_layers = battle.opponent_side_conditions.get("spikes", 0)
-                        if opp_remaining >= 2 and (not spikes_layers or spikes_layers < 3) and battle.turn <= 10:
-                            score += 150  # Higher Spikes priority
-                    except Exception:
-                        pass
-                if move.id == "taunt" and battle.turn <= 9:
-                    score += 105
-                if move.id == "psychoboost" and any(t in {"DARK", "FAIRY", "STEEL"} for t in opp_types):
-                    return -float('inf')
-
-            if my_pokemon.species and "Eternatus" in my_pokemon.species:
-                if move.id == "fireblast":
-                    try:
-                        if "FAIRY" in opp_types or "STEEL" in opp_types:
-                            score += 120
-                        if battle.weather.get("SunnyDay", 0):
-                            score += 100
-                    except Exception:
-                        pass
-                if move.id == "dynamaxcannon" and any(t in {"FAIRY", "NORMAL"} for t in opp_types):
-                    return -float('inf')
-
-            if my_pokemon.species and "Koraidon" in my_pokemon.species:
-                if move.id == "flamecharge":
-                    try:
-                        if "FAIRY" in opp_types or "STEEL" in opp_types:
-                            score += 120
-                        if battle.weather.get("SunnyDay", 0):
-                            score += 100
-                    except Exception:
-                        pass
-                if move.id == "closecombat":
-                    try:
-                        if any(t in {"FAIRY", "STEEL"} for t in opp_types):
-                            score -= 110  # Stronger penalty
-                        if "DARK" in opp_types:
-                            score += 110
-                    except Exception:
+                        if hasattr(opp_pokemon, 'moves') and opp_pokemon.moves:
+                            setup_moves = {"swordsdance", "calmmind", "agility", "recover"}
+                            if any(m.id in setup_moves for m in opp_pokemon.moves.values()):
+                                score += 150
+                    except:
                         pass
 
+            # Species-specific logic improvements
+            if my_pokemon.species:
+                if "Deoxys-Speed" in my_pokemon.species:
+                    if move.id == "spikes":
+                        try:
+                            spikes_layers = battle.opponent_side_conditions.get("spikes", 0)
+                            remaining_opponents = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+                            if remaining_opponents >= 2 and spikes_layers < 2 and battle.turn <= 8:
+                                score += 170
+                        except:
+                            pass
+
+                elif "Kingambit" in my_pokemon.species:
+                    # Supreme Overlord boost calculation
+                    fainted_allies = sum(1 for p in battle.team.values() if p.fainted)
+                    if move.id in {"suckerpunch", "kowtowcleave", "ironhead"}:
+                        score += fainted_allies * 15
+
+                elif "Arceus-Fairy" in my_pokemon.species:
+                    if move.id == "judgment":
+                        # Extra damage vs Dragons and Fighting types
+                        if any(t in {"DRAGON", "FIGHTING", "DARK"} for t in opp_types):
+                            score += 80
+
+            # Priority move handling
+            if hasattr(move, 'priority') and move.priority > 0:
+                score += 60
+                # Extra bonus if opponent is low on HP
+                if (opp_pokemon.current_hp_fraction or 1.0) <= 0.3:
+                    score += 80
+
+            # Sucker Punch specific logic
             if move.id == "suckerpunch":
                 try:
-                    if any(t in {"FAIRY", "STEEL"} for t in opp_types):
-                        score -= 70  # Stronger penalty
-                    if (opp_pokemon.current_hp_fraction or 1.0) <= 0.06:
-                        last_move = battle.opponent_last_move
-                        if last_move and gen_data.moves.get(last_move.id, {}).get("category", "Status") != "Status":
-                            score += 100
-                        else:
-                            score += 50
+                    # Predict if opponent will use an attacking move
+                    if (opp_pokemon.current_hp_fraction or 1.0) <= 0.4:
+                        score += 100
                     else:
-                        score += 30
-                except Exception:
+                        score += 40
+
+                    # Penalty against Fairy types
+                    if "FAIRY" in opp_types:
+                        score -= 50
+                except:
                     score += 40
 
-            if move.priority > 0 or (move.id == "wildcharge" and opp_pokemon.moves and any(m.priority > 0 for m in opp_pokemon.moves.values())):
+            # Accuracy penalties
+            if accuracy < 85 and category != "Status":
+                score -= 60
+
+            # High power move bonus
+            if base_power >= 120 and effectiveness >= 1:
                 score += 70
-
-            # Hazard penalty
-            try:
-                if (battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get("spikes", 0)) and \
-                   (my_pokemon.current_hp_fraction or 1.0) <= 0.5 and move.id != "recover":
-                    score -= 90
-            except Exception:
-                pass
-
-            # Boost for high-damage moves
-            if base_power >= 100 and effectiveness >= 1:
-                score += 60
-
-            # Penalize low-accuracy moves
-            if accuracy < 90 and category != "Status":
-                score -= 50
 
             return score
 
         def switch_score(switch):
             score = 0
             try:
-                for mv in opp_pokemon.moves.values():
-                    eff = mv.type.damage_multiplier(switch.type_1, switch.type_2) if mv.type and switch.type_1 else 1.0
-                    if eff < 1:
-                        score += 80
-                    elif eff > 1:
+                # Type matchup evaluation
+                switch_types = get_pokemon_types(switch)
+                opp_types = get_pokemon_types(opp_pokemon)
+
+                # Check defensive matchup
+                if hasattr(opp_pokemon, 'moves') and opp_pokemon.moves:
+                    for mv in opp_pokemon.moves.values():
+                        if mv.type and switch.type_1:
+                            eff = mv.type.damage_multiplier(switch.type_1, switch.type_2) if mv.type else 1.0
+                            if eff < 0.5:
+                                score += 100
+                            elif eff > 2:
+                                score -= 120
+
+                # HP consideration
+                hp_frac = switch.current_hp_fraction if switch.current_hp_fraction is not None else 1.0
+                score += hp_frac * 100
+
+                # Hazard damage consideration
+                if battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get(
+                        "spikes", 0):
+                    if hp_frac < 0.7:
                         score -= 80
+
+                # Mirror match switching logic
+                if is_mirror_match():
+                    # Specific advantageous switches in mirrors
+                    if switch.species == "Arceus-Fairy" and any(t in {"DRAGON", "FIGHTING", "DARK"} for t in opp_types):
+                        score += 120
+                    elif switch.species == "Kingambit" and "FAIRY" in opp_types:
+                        score += 100
+                    elif switch.species == "Zacian-Crowned":
+                        score += 80  # Generally strong
+
+                # Don't switch if current Pokemon can still be useful
+                if (my_pokemon.current_hp_fraction or 0) > 0.6:
+                    score -= 50
+
             except Exception:
                 pass
-            hp_frac = switch.current_hp_fraction if switch.current_hp_fraction is not None else 1.0
-            try:
-                if battle.opponent_side_conditions.get("stealthrock", 0) or battle.opponent_side_conditions.get("spikes", 0):
-                    score += hp_frac * 100
-            except Exception:
-                pass
-            # Mirror match matchups
-            try:
-                opp_types = []
-                if opp_pokemon.type_1 and opp_pokemon.type_1.name:
-                    opp_types.append(opp_pokemon.type_1.name)
-                if opp_pokemon.type_2 and opp_pokemon.type_2.name:
-                    opp_types.append(opp_pokemon.type_2.name)
-                if switch.species == "Eternatus" and any(t in {"FAIRY", "STEEL"} for t in opp_types):
-                    score += 120
-                if switch.species == "Koraidon" and "DARK" in opp_types:
-                    score += 120
-                if switch.species == "Kingambit" and any(t in {"FAIRY", "STEEL"} for t in opp_types):
-                    score += 110
-                if switch.species == "Arceus-Fairy" and any(t in {"DRAGON", "FIGHTING"} for t in opp_types):
-                    score += 110
-            except Exception:
-                pass
-            if battle.weather.get("SunnyDay", 0) and switch.species in ["Eternatus", "Koraidon"]:
-                score += 100
-            if switch.species in ["Zacian-Crowned", "Kingambit"]:
-                score += 50
-            return score + (hp_frac * 80)
 
-        def dmg_est(attacker, defender, mv):
-            if attacker is None or defender is None or mv is None:
-                return 0.0
-            mi = gen_data.moves.get(mv.id, {})
-            bp = float(mv.base_power or mi.get("basePower") or 0.0)
-            if bp <= 0 or mi.get("category", "Status") == "Status":
-                return 0.0
-            acc = _acc_to_pct(mi.get("accuracy", mv.accuracy)) / 100.0
-            try:
-                stab = 1.5 if mv.type in {attacker.type_1, attacker.type_2} else 1.0
-                if mv.type.name == "FIRE" and battle.weather.get("SunnyDay", 0):
-                    stab *= 1.5
-                eff = mv.type.damage_multiplier(defender.type_1, defender.type_2) if mv.type and defender.type_1 else 1.0
-                if eff == 0:
-                    return 0.0
-            except Exception:
-                stab = 1.0
-                eff = 1.0
-            boost = 1.0
-            if attacker.species == "Zacian-Crowned" and mv.category == "Physical":
-                boost *= 1.3
-            if attacker.species == "Kingambit" and mv.category == "Physical":
-                boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.team.values())
-            if defender.species == "Zacian-Crowned" and mv.category == "Physical":
-                boost /= 1.3
-            if defender.species == "Kingambit" and mv.category == "Physical":
-                boost /= 1.2 + 0.1 * sum(p.fainted for p in battle.opponent_team.values())
-            return bp * acc * stab * eff * boost
+            return score
 
-        def opp_best_move_damage(vs_defender):
-            best = 0.0
-            if getattr(opp_pokemon, "moves", None):
-                for mv in opp_pokemon.moves.values():
-                    best = max(best, dmg_est(opp_pokemon, vs_defender, mv))
-            if best == 0.0:
-                try:
-                    for t in (opp_pokemon.type_1, opp_pokemon.type_2):
-                        if not t:
-                            continue
-                        eff = t.damage_multiplier(vs_defender.type_1, vs_defender.type_2) if vs_defender.type_1 else 1.0
-                        boost = 1.0
-                        if opp_pokemon.species == "Zacian-Crowned":
-                            boost *= 1.3
-                        if opp_pokemon.species == "Kingambit":
-                            boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.opponent_team.values())
-                        best = max(best, 180.0 * 1.5 * eff * boost)
-                except Exception:
-                    pass
-            return best
-
-        def our_best_damage_next_turn(vs_defender):
-            best = 0.0
-            for mv in battle.available_moves:
-                best = max(best, dmg_est(my_pokemon, vs_defender, mv))
-            return best
-
-        def opp_switch_targets():
-            bench = []
-            for p in battle.opponent_team.values():
-                if not p or p.fainted or p.active:
-                    continue
-                bench.append(p)
-            return bench
-
-        ALPHA = 2.0  # Stronger defensive focus
-        GAMMA = 0.2  # Focus on immediate impact
-
-        def value_if_we_use_move(mv):
-            our_immediate = move_score(mv)
-            opp_back = opp_best_move_damage(my_pokemon)
-            worst = our_immediate - ALPHA * opp_back
-            for tgt in opp_switch_targets():
-                immediate_on_switch = dmg_est(my_pokemon, tgt, mv)
-                our_next = our_best_damage_next_turn(tgt)
-                their_next = opp_best_move_damage(my_pokemon)
-                line_val = immediate_on_switch + GAMMA * (our_next - ALPHA * their_next)
-                worst = min(worst, line_val)
-            return worst
-
-        def value_if_we_switch(sw):
-            opp_free = opp_best_move_damage(sw)
-            our_next = 0.0
-            if getattr(sw, "moves", None):
-                for mv in sw.moves.values():
-                    our_next = max(our_next, dmg_est(sw, opp_pokemon, mv))
-            if our_next == 0.0:
-                try:
-                    for t in (sw.type_1, sw.type_2):
-                        if not t:
-                            continue
-                        eff = t.damage_multiplier(opp_pokemon.type_1, opp_pokemon.type_2) if opp_pokemon.type_1 else 1.0
-                        boost = 1.0
-                        if sw.species == "Zacian-Crowned":
-                            boost *= 1.3
-                        if sw.species == "Kingambit":
-                            boost *= 1.2 + 0.1 * sum(p.fainted for p in battle.team.values())
-                        our_next = max(our_next, 180.0 * 1.5 * eff * boost)
-                except Exception:
-                    pass
-            hp_frac = sw.current_hp_fraction if sw.current_hp_fraction is not None else 1.0
-            return -ALPHA * opp_free + GAMMA * our_next + 15.0 * hp_frac
-
+        # Evaluate all possible actions
         best_action = None
         best_score = float("-inf")
 
+        # Evaluate moves
         for mv in battle.available_moves:
-            sc = value_if_we_use_move(mv)
+            sc = move_score(mv)
             if sc > best_score:
                 best_score = sc
                 best_action = self.create_order(mv)
 
+        # Evaluate switches
         for sw in battle.available_switches:
-            sc = value_if_we_switch(sw)
+            sc = switch_score(sw)
             if sc > best_score:
                 best_score = sc
                 best_action = self.create_order(sw)
+
+        # Emergency fallback - if no good action found, prefer attacking moves
+        if best_action is None or best_score < -100:
+            attacking_moves = [m for m in battle.available_moves if (m.base_power or 0) > 0]
+            if attacking_moves:
+                best_action = self.create_order(max(attacking_moves, key=lambda x: x.base_power or 0))
 
         return best_action or self.choose_random_move(battle)
