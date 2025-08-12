@@ -225,6 +225,59 @@ class TacticalLayer(DecisionLayer):
     def __init__(self):
         super().__init__(priority=500)
 
+    def _type_name(self, t) -> Optional[str]:
+        if t is None:
+            return None
+        # poke_env Type objects often have .name; strings are fine too
+        return (getattr(t, "name", t)).upper()
+
+    def _pokemon_type_names(self, pokemon) -> List[str]:
+        names = []
+        for attr in ("type_1", "type_2"):
+            t = getattr(pokemon, attr, None)
+            if t:
+                names.append(self._type_name(t))
+        return names
+
+    def _move_type_name(self, context: BattleContext, move) -> Optional[str]:
+        # Prefer static data (stable and complete), fall back to runtime object
+        mi = context.gen_data.moves.get(move.id, {})
+        t = mi.get("type")
+        if t:
+            return str(t).upper()
+        # fallback to poke_env move.type if present
+        return self._type_name(getattr(move, "type", None))
+
+    def _type_effectiveness(self, context: BattleContext, move_type: Optional[str],
+                            defender_types: List[str]) -> float:
+        if not move_type:
+            return 1.0
+        chart = context.gen_data.type_chart
+        eff = 1.0
+        for d in defender_types:
+            # chart[DEFENDER][ATTACKER]
+            eff *= chart.get(d, {}).get(move_type, 1.0)
+        return eff
+
+    def _stab_multiplier(self, context: BattleContext, move_type: Optional[str]) -> float:
+        if not move_type:
+            return 1.0
+        original_types = set(self._pokemon_type_names(context.my_pokemon))
+        # Try to read tera type if available
+        tera = getattr(context.my_pokemon, "tera_type", None) \
+               or getattr(context.my_pokemon, "terastallize_type", None)
+        tera = self._type_name(tera)
+
+        # SV STAB (approximation):
+        # - If move matches Tera type => 2.0
+        # - Else if move matches original types => 1.5
+        # - Else => 1.0
+        if tera and move_type == tera:
+            return 2.0
+        if move_type in original_types:
+            return 1.5
+        return 1.0
+
     def should_override(self, context: BattleContext) -> bool:
         return False
 
@@ -260,59 +313,53 @@ class TacticalLayer(DecisionLayer):
         return actions
 
     def _move_score(self, context: BattleContext, move) -> float:
-        move_info = context.gen_data.moves.get(move.id, {})
-        base_power = move_info.get("basePower", move.base_power or 0)
-        accuracy = move_info.get("accuracy", move.accuracy)
+        mi = context.gen_data.moves.get(move.id, {})
+        base_power = mi.get("basePower", move.base_power or 0)
 
-        if accuracy is True:
-            accuracy = 1.0
-        elif accuracy is False or accuracy is None:
-            accuracy = 0.0
+        # Accuracy -> [0..1]
+        acc = mi.get("accuracy", move.accuracy)
+        if acc is True:
+            acc = 1.0
+        elif acc in (False, None):
+            acc = 0.0
         else:
-            accuracy = float(accuracy) / 100.0
+            acc = float(acc) / 100.0
 
-        # Type effectiveness
-        effectiveness = 1.0
-        try:
-            if hasattr(move, 'type') and move.type and context.opponent_pokemon:
-                opp_types = self._get_pokemon_types(context.opponent_pokemon)
-                for opp_type in opp_types:
-                    eff = move.type.damage_multiplier(opp_type)
-                    effectiveness *= eff
-        except:
-            effectiveness = 1.0
+        # Type effectiveness via GenData.type_chart
+        move_type = self._move_type_name(context, move)
+        defender_types = self._pokemon_type_names(context.opponent_pokemon)
+        effectiveness = self._type_effectiveness(context, move_type, defender_types)
 
-        # Bad type matchups
-        if effectiveness <= 0.25:
+        # Skip terrible hits / immunities
+        if effectiveness == 0.0 or effectiveness <= 0.25:
             return 0.0
 
-        # STAB
-        stab = 1.0
-        try:
-            if hasattr(move, 'type') and move.type and context.my_pokemon:
-                my_types = self._get_pokemon_types(context.my_pokemon)
-                if move.type in my_types:
-                    stab = 1.5
-        except:
-            stab = 1.0
+        # STAB (with rough Tera handling)
+        stab = self._stab_multiplier(context, move_type)
 
-        # Species-specific bonuses
+        # Simple species/context bonuses you already had
         species_bonus = self._species_move_bonus(context, move)
+        priority_bonus = 20 if getattr(move, "priority", 0) > 0 else 0
 
-        # Priority bonus
-        priority_bonus = 20 if getattr(move, 'priority', 0) > 0 else 0
-
-        return (base_power * effectiveness * stab * accuracy) + species_bonus + priority_bonus
+        return (base_power * effectiveness * stab * acc) + species_bonus + priority_bonus
 
     def _utility_score(self, context: BattleContext, move) -> float:
-        if move.id == 'thunderwave':
-            if context.opponent_pokemon and not getattr(context.opponent_pokemon, 'status', None):
-                opp_types = self._get_pokemon_types(context.opponent_pokemon)
-                if 'ELECTRIC' not in [t.name if hasattr(t, 'name') else str(t) for t in opp_types]:
-                    return 50.0
-        elif move.id == 'recover':
-            if context.my_pokemon:
-                hp_frac = getattr(context.my_pokemon, 'current_hp_fraction', 1.0) or 1.0
+        if move.id == "thunderwave":
+            opp = context.opponent_pokemon
+            if opp and not getattr(opp, "status", None):
+                opp_types = self._pokemon_type_names(opp)
+                # Electric types cannot be paralyzed at all
+                if "ELECTRIC" in opp_types:
+                    return 0.0
+                # Ground is immune to Electric-type moves (TWave fails)
+                elec_vs_target = self._type_effectiveness(context, "ELECTRIC", opp_types)
+                if elec_vs_target == 0.0:
+                    return 0.0
+                return 50.0
+        elif move.id == "recover":
+            me = context.my_pokemon
+            if me:
+                hp_frac = getattr(me, "current_hp_fraction", 1.0) or 1.0
                 if hp_frac <= 0.6:
                     return 80.0
         return 0.0
