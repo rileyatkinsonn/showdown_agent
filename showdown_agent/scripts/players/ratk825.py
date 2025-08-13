@@ -1,5 +1,9 @@
 import random
-from typing import List, Optional
+import time
+import math
+from typing import List, Optional, Dict, Tuple
+from dataclasses import dataclass
+from enum import Enum
 
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.double_battle import DoubleBattle
@@ -80,9 +84,48 @@ Jolly Nature
 - Close Combat  
 """
 
+
+@dataclass
+class MCTSNode:
+    """Simple MCTS node for tracking game tree search"""
+    battle_state_hash: str
+    parent: Optional['MCTSNode'] = None
+    children: Dict[str, 'MCTSNode'] = None
+    visits: int = 0
+    total_value: float = 0.0
+    action_taken: Optional[BattleOrder] = None
+    untried_actions: List[BattleOrder] = None
+
+    def __post_init__(self):
+        if self.children is None:
+            self.children = {}
+        if self.untried_actions is None:
+            self.untried_actions = []
+
+    @property
+    def average_value(self) -> float:
+        return self.total_value / self.visits if self.visits > 0 else 0.0
+
+    def is_fully_expanded(self) -> bool:
+        return len(self.untried_actions) == 0
+
+
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
+
+        # MCTS Configuration
+        self.mcts_simulations = 100  # Number of MCTS simulations per move
+        self.exploration_constant = 1.4  # UCB1 exploration parameter
+        self.max_search_time = 10.0  # Maximum time for search in seconds
+
+        # Keep your existing constants
+        self.SPEED_TIER_COEFICIENT = 0.1
+        self.HP_FRACTION_COEFICIENT = 0.4
+        self.SWITCH_OUT_MATCHUP_THRESHOLD = -2
+
+        # MCTS tree storage
+        self.mcts_tree_cache = {}
 
     ENTRY_HAZARDS = {
         "spikes": SideCondition.SPIKES,
