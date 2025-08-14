@@ -461,32 +461,39 @@ class DamageCalculator:
         if action.type != ActionType.MOVE:
             return 0.0
 
+        if not action.target:
+            return 0.1  # fallback value
+
         move_id = self._normalize_move_id(action.target)
-        move = self.gen_data.moves.get(move_id)
+        if not move_id:
+            return 0.1  # fallback for unparseable move
+
+        try:
+            move = self.gen_data.moves.get(move_id)
+        except Exception:
+            return 0.1  # unknown move, assume weak
+
         if not move:
-            return 0.2  # default low power for unknown moves
+            return 0.1  # move not found in database
 
-        base_power = move.base_power or 50  # fallback if unspecified
-        move_type = move.type
-        move_cat = move.category
-
-        # Rough guess of attacker/defender typing from name
+        base_power = move.base_power or 50
+        move_type = move.type or "normal"
         attacker_name = state.my_active.lower()
         defender_name = state.opp_active.lower()
 
         attacker_types = self._guess_types(attacker_name)
         defender_types = self._guess_types(defender_name)
 
-        # STAB
         stab = 1.5 if move_type in attacker_types else 1.0
 
-        # Type effectiveness (multiply effectiveness across both defender types)
         effectiveness = 1.0
         for def_type in defender_types:
-            effectiveness *= self.gen_data.type_chart[move_type].damage_multiplier(def_type)
+            try:
+                effectiveness *= self.gen_data.type_chart[move_type].damage_multiplier(def_type)
+            except Exception:
+                continue
 
-        # Very crude scaling formula (normalized)
-        damage = (base_power / 120) * stab * effectiveness
+        damage = (base_power / 120.0) * stab * effectiveness
         return min(1.0, damage)
 
     def _normalize_move_id(self, move: str) -> str:
