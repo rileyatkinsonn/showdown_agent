@@ -789,6 +789,10 @@ class CustomAgent(Player):
     def _should_switch_out(self, battle: AbstractBattle):
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
+
+        # NEVER switch if you just switched in (anti-switching spam)
+        if battle.turn <= 1 or getattr(self, '_last_switched_turn', -2) >= battle.turn - 1:
+            return False
         # If there is a decent switch in...
         if [
             m
@@ -812,6 +816,9 @@ class CustomAgent(Player):
                     self._estimate_matchup(active, opponent)
                     < self.SWITCH_OUT_MATCHUP_THRESHOLD
             ):
+                return True
+            if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
+                self._last_switched_turn = battle.turn
                 return True
         return False
 
@@ -901,6 +908,14 @@ class CustomAgent(Player):
         return self._heuristic_choose_move(battle)
 
     def _should_use_mcts(self, battle: AbstractBattle) -> bool:
+        """Disable MCTS in mirror matches - use proven heuristic"""
+        # Check if it's a mirror match
+        my_species = {p.species for p in battle.team.values()}
+        opp_species = {p.species for p in battle.opponent_team.values() if p}
+
+        if len(my_species.intersection(opp_species)) >= 4:
+            return False  # Never use MCTS in mirrors
+
         """Only use MCTS in very specific endgame scenarios"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
@@ -953,25 +968,33 @@ class CustomAgent(Player):
         return self._heuristic_choose_move(battle)
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Decide when to use Terastallization"""
+        """Aggressive Tera usage for mirrors"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
         if not battle.can_tera or not active or not opponent:
             return False
 
-        # Tera if it flips a bad matchup to good
+        # Tera early for defensive purposes in bad matchups
         current_matchup = self._estimate_matchup(active, opponent)
 
-        # If we're in a bad matchup and tera might help
-        if current_matchup < -1.0:  # Bad matchup
-            # Check if we're taking super-effective damage
-            current_damage = max([active.damage_multiplier(t) for t in opponent.types if t])
-            if current_damage > 1.0:  # Taking super-effective damage
+        # 1. Emergency defensive Tera when taking super-effective damage
+        if active.current_hp_fraction < 0.6:
+            damage_taken = max([active.damage_multiplier(t) for t in opponent.types if t])
+            if damage_taken > 1.0:  # Taking super-effective damage
                 return True
 
-        # Tera for offensive boost when we have advantage
-        if current_matchup > 1.0 and active.current_hp_fraction > 0.5:
+        # 2. Offensive Tera when healthy and can KO
+        if (active.current_hp_fraction > 0.7 and
+                opponent.current_hp_fraction < 0.4 and
+                current_matchup > 0):
+            return True
+
+        # 3. Tera when setting up (Calm Mind, Swords Dance)
+        if active.current_hp_fraction == 1.0 and any(
+                move.boosts and sum(move.boosts.values()) >= 2
+                for move in battle.available_moves
+        ):
             return True
 
         return False
