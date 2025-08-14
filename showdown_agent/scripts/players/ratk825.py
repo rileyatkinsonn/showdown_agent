@@ -497,6 +497,8 @@ class DamageCalculator:
         return min(1.0, damage)
 
     def _normalize_move_id(self, move: str) -> str:
+        if not isinstance(move, str):
+            return ""
         return move.lower().replace(" ", "").replace("-", "")
 
     def _guess_types(self, mon_name: str) -> List[str]:
