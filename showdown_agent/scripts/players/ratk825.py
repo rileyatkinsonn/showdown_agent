@@ -725,6 +725,8 @@ class CustomAgent(Player):
         self.mcts = MCTSAlgorithm(self.game_manager)
         self.mcts.max_simulations = 500  # Reduce for faster testing
 
+        self._last_switched_turn = -2
+
     def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
         score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
         score -= max(
@@ -810,11 +812,6 @@ class CustomAgent(Player):
             if (
                     active.boosts["spa"] <= -3
                     and active.stats["atk"] <= active.stats["spa"]
-            ):
-                return True
-            if (
-                    self._estimate_matchup(active, opponent)
-                    < self.SWITCH_OUT_MATCHUP_THRESHOLD
             ):
                 return True
             if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
