@@ -395,28 +395,34 @@ class GameStateManager:
         return my_alive == 0 or opp_alive == 0
 
     def evaluate_state(self, state: GameState) -> float:
-        """Evaluate position using proven heuristics"""
+        """Evaluate position with heavy switch penalty"""
         if self.is_terminal(state):
             my_alive = sum(1 for hp in state.my_team_hp if hp > 0)
             return 1.0 if my_alive > 0 else 0.0
 
-        # Use team count heavily (like your original heuristic)
+        # Team count advantage
         my_count = sum(1 for hp in state.my_team_hp if hp > 0)
         opp_count = sum(1 for hp in state.opp_team_hp if hp > 0)
 
         if my_count + opp_count == 0:
             return 0.5
 
-        # Team advantage is primary factor
         team_score = my_count / (my_count + opp_count)
 
-        # HP advantage is secondary
+        # HP advantage
         my_hp = sum(state.my_team_hp)
         opp_hp = sum(state.opp_team_hp)
         hp_score = my_hp / (my_hp + opp_hp) if (my_hp + opp_hp) > 0 else 0.5
 
-        # Weight team count much more heavily (like successful bots)
-        return 0.8 * team_score + 0.2 * hp_score
+        # Heavy penalty for having low HP active Pokemon (discourages switching)
+        active_hp_penalty = 0.0
+        if len(state.my_team_hp) > 0:
+            # Assume active is first in list for now
+            active_hp = state.my_team_hp[0]
+            if active_hp < 0.5:
+                active_hp_penalty = 0.1  # Penalty for low HP active
+
+        return 0.8 * team_score + 0.2 * hp_score - active_hp_penalty
 
     def apply_chance_outcome(self, state: GameState, outcome: str) -> GameState:
         """Apply a chance outcome to state"""
@@ -464,7 +470,7 @@ class MCTSAlgorithm:
     def __init__(self, game_manager: GameStateManager):
         self.game_manager = game_manager
         self.exploration_constant = 1.4
-        self.max_simulations = 1000
+        self.max_simulations = 50
         self.max_depth = 6  # Can go deeper without time pressure
         self.min_visits_for_confidence = 50  # Ensure robust decisions
 
@@ -872,24 +878,25 @@ class CustomAgent(Player):
         return self._heuristic_choose_move(battle)
 
     def _should_use_mcts(self, battle: AbstractBattle) -> bool:
-        """Decide when to use MCTS vs heuristic"""
-        # Use MCTS for important decisions
+        """Only use MCTS in very specific endgame scenarios"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
         if not active or not opponent:
             return False
 
-        # Use MCTS when:
-        # 1. Both pokemon are healthy (important decisions)
-        # 2. Close matchup (not obvious what to do)
-        # 3. Late game (every decision matters)
+        # Only use MCTS in endgame (2 or fewer Pokemon left)
+        n_remaining = sum(1 for p in battle.team.values() if not p.fainted)
 
-        both_healthy = active.current_hp_fraction > 0.5 and opponent.current_hp_fraction > 0.5
-        close_matchup = abs(self._estimate_matchup(active, opponent)) < 1.0
-        late_game = sum(1 for p in battle.team.values() if not p.fainted) <= 3
+        if n_remaining <= 2:
+            return True
 
-        return both_healthy or close_matchup or late_game
+        # Or when we're in a really close endgame position
+        close_endgame = (n_remaining == 3 and
+                         active.current_hp_fraction < 0.3 and
+                         opponent.current_hp_fraction < 0.3)
+
+        return close_endgame
 
     def choose_move(self, battle: AbstractBattle):
         if isinstance(battle, DoubleBattle):
