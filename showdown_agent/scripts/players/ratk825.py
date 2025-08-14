@@ -384,6 +384,33 @@ class GameStateManager:
         # Count is more important than raw HP
         return 0.3 * hp_score + 0.7 * count_score
 
+    def apply_chance_outcome(self, state: GameState, outcome: str) -> GameState:
+        """Apply a chance outcome to state"""
+        # For now, just return the state unchanged
+        # Later we can add specific logic for different outcomes
+        return state
+
+    def apply_action_with_outcome(self, state: GameState, action: Action, outcome: str) -> GameState:
+        """Apply action with specific random outcome"""
+        new_state = self.apply_action(state, action)
+
+        # Modify based on outcome
+        if outcome == "Miss" and action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+            # Move missed - no damage dealt, just return state without damage
+            return GameState(
+                my_active=new_state.my_active,
+                opp_active=new_state.opp_active,
+                my_team_hp=state.my_team_hp.copy(),  # Use original HP (no damage)
+                opp_team_hp=state.opp_team_hp.copy(),  # Use original HP (no damage)
+                turn_number=new_state.turn_number,
+                field_conditions=new_state.field_conditions
+            )
+        elif outcome == "Hit" and action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+            # Move hit - damage was already applied in apply_action
+            return new_state
+
+        return new_state
+
 
 class SimpleDamageCalculator:
     """Simple damage calculator for MCTS simulation"""
@@ -473,24 +500,16 @@ class MCTSAlgorithm:
 
     def _create_child_from_max_action(self, parent: MaxNode, action: Action) -> TreeNode:
         """Create child node after MAX player takes action"""
-        # Determine if action leads to chance node or directly to MIN
-        if self._action_has_randomness(action):
-            # Create chance node
-            new_state = parent.state  # State doesn't change until outcome is determined
-            return ChanceNode(new_state, action, parent)
-        else:
-            # Deterministic action - go straight to MIN node
-            new_state = self.game_manager.apply_action(parent.state, action)
-            return MinNode(new_state, parent)
+        # For now, skip chance nodes and go directly to deterministic outcomes
+        # This simplifies the tree while we debug
+        new_state = self.game_manager.apply_action(parent.state, action)
+        return MinNode(new_state, parent)
 
     def _create_child_from_min_action(self, parent: MinNode, action: Action) -> TreeNode:
         """Create child node after MIN player takes action"""
-        if self._action_has_randomness(action):
-            new_state = parent.state
-            return ChanceNode(new_state, action, parent)
-        else:
-            new_state = self.game_manager.apply_action(parent.state, action)
-            return MaxNode(new_state, parent)
+        # Same - skip chance nodes for now
+        new_state = self.game_manager.apply_action(parent.state, action)
+        return MaxNode(new_state, parent)
 
     def _create_child_from_chance_outcome(self, parent: ChanceNode, outcome: str) -> TreeNode:
         """Create child node after chance outcome is determined"""
@@ -507,9 +526,7 @@ class MCTSAlgorithm:
 
     def _action_has_randomness(self, action: Action) -> bool:
         """Check if action involves random elements"""
-        if isinstance(action, Action):
-            # Moves have randomness (accuracy, damage rolls, crits)
-            return action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]
+        # Temporarily disable randomness to simplify tree
         return False
 
     def _simulation(self, node: TreeNode) -> float:
