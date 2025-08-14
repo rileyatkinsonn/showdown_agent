@@ -181,7 +181,12 @@ class MaxNode(TreeNode):
 
     def _get_active_index(self) -> int:
         """Get index of currently active pokemon"""
-        return int(self.state.my_active.split('_')[1]) if '_' in self.state.my_active else 0
+        if '_' in self.state.my_active and self.state.my_active.startswith('Pokemon_'):
+            try:
+                return int(self.state.my_active.split('_')[1])
+            except (ValueError, IndexError):
+                return 0
+        return 0
 
     def get_legal_actions(self) -> List[Action]:
         return self.untried_actions
@@ -233,7 +238,12 @@ class MinNode(TreeNode):
         return actions
 
     def _get_opp_active_index(self) -> int:
-        return int(self.state.opp_active.split('_')[1]) if '_' in self.state.opp_active else 0
+        if '_' in self.state.opp_active and self.state.opp_active.startswith(('Pokemon_', 'Opp_Pokemon_')):
+            try:
+                return int(self.state.opp_active.split('_')[-1])
+            except (ValueError, IndexError):
+                return 0
+        return 0
 
     def get_legal_actions(self) -> List[Action]:
         return self.untried_actions
@@ -348,12 +358,35 @@ class GameStateManager:
 
     def _get_active_index(self, pokemon_name: str) -> int:
         """Get team index from pokemon name"""
-        # Simple mapping - you can make this more sophisticated
+        # Handle both abstract names (Pokemon_0) and real names (deoxys-speed)
+        if '_' in pokemon_name and pokemon_name.startswith('Pokemon_'):
+            try:
+                return int(pokemon_name.split('_')[1])
+            except (ValueError, IndexError):
+                return 0
+
+        # Handle real pokemon names by mapping to team positions
         name_to_index = {
-            "deoxys-speed": 0, "kingambit": 1, "zacian-crowned": 2,
-            "arceus-fairy": 3, "eternatus": 4, "koraidon": 5
+            "deoxys-speed": 0,
+            "kingambit": 1,
+            "zacian-crowned": 2,
+            "arceus-fairy": 3,
+            "eternatus": 4,
+            "koraidon": 5
         }
         return name_to_index.get(pokemon_name.lower(), 0)
+
+    def _get_opp_active_index(self, pokemon_name: str) -> int:
+        """Get opponent team index from pokemon name"""
+        if '_' in pokemon_name and pokemon_name.startswith(('Pokemon_', 'Opp_Pokemon_')):
+            try:
+                return int(pokemon_name.split('_')[-1])  # Get last part after splitting
+            except (ValueError, IndexError):
+                return 0
+
+        # For real opponent pokemon names, we don't know their team order exactly
+        # so just return 0 as default (this is a limitation of the abstraction)
+        return 0
 
     def is_terminal(self, state: GameState) -> bool:
         """Check if game is over"""
@@ -837,7 +870,7 @@ class CustomAgent(Player):
 
         # Ultimate fallback
         return self._heuristic_choose_move(battle)
-    
+
     def _should_use_mcts(self, battle: AbstractBattle) -> bool:
         """Decide when to use MCTS vs heuristic"""
         # Use MCTS for important decisions
