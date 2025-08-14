@@ -166,10 +166,11 @@ class MaxNode(TreeNode):
     def _generate_actions(self) -> List[Action]:
         """Generate all possible actions from this state"""
         actions = []
-        # Add moves
+        # Add regular moves only (no dynamax)
         for move in ["Move_A", "Move_B", "Move_C", "Move_D"]:
             actions.append(Action(ActionType.MOVE, move))
-            actions.append(Action(ActionType.MOVE, move, is_dynamax=True))
+            # Remove dynamax actions since they're not available
+            # actions.append(Action(ActionType.MOVE, move, is_dynamax=True))
 
         # Add switches
         for i, hp in enumerate(self.state.my_team_hp):
@@ -219,10 +220,10 @@ class MinNode(TreeNode):
 
     def _generate_opponent_actions(self) -> List[Action]:
         """Generate opponent's possible actions"""
-        # Simplified - assume opponent has similar action space
         actions = []
         for move in ["Opp_Move_A", "Opp_Move_B", "Opp_Move_C"]:
             actions.append(Action(ActionType.MOVE, move))
+            # Remove dynamax for opponent too
 
         # Add opponent switches
         for i, hp in enumerate(self.state.opp_team_hp):
@@ -361,28 +362,28 @@ class GameStateManager:
         return my_alive == 0 or opp_alive == 0
 
     def evaluate_state(self, state: GameState) -> float:
-        """Evaluate position value [0, 1] where 1 = winning for MAX"""
+        """Evaluate position using proven heuristics"""
         if self.is_terminal(state):
             my_alive = sum(1 for hp in state.my_team_hp if hp > 0)
             return 1.0 if my_alive > 0 else 0.0
 
-        # Enhanced evaluation using your existing heuristics
-        my_hp = sum(state.my_team_hp)
-        opp_hp = sum(state.opp_team_hp)
-
-        # Team count advantage (more important than raw HP)
+        # Use team count heavily (like your original heuristic)
         my_count = sum(1 for hp in state.my_team_hp if hp > 0)
         opp_count = sum(1 for hp in state.opp_team_hp if hp > 0)
 
         if my_count + opp_count == 0:
             return 0.5
 
-        # Weighted evaluation
-        hp_score = my_hp / (my_hp + opp_hp) if (my_hp + opp_hp) > 0 else 0.5
-        count_score = my_count / (my_count + opp_count)
+        # Team advantage is primary factor
+        team_score = my_count / (my_count + opp_count)
 
-        # Count is more important than raw HP
-        return 0.3 * hp_score + 0.7 * count_score
+        # HP advantage is secondary
+        my_hp = sum(state.my_team_hp)
+        opp_hp = sum(state.opp_team_hp)
+        hp_score = my_hp / (my_hp + opp_hp) if (my_hp + opp_hp) > 0 else 0.5
+
+        # Weight team count much more heavily (like successful bots)
+        return 0.8 * team_score + 0.2 * hp_score
 
     def apply_chance_outcome(self, state: GameState, outcome: str) -> GameState:
         """Apply a chance outcome to state"""
@@ -793,35 +794,50 @@ class CustomAgent(Player):
     def _action_to_battle_order(self, action: Action, battle: AbstractBattle) -> BattleOrder:
         """Convert abstract Action to real BattleOrder"""
         if action.type == ActionType.MOVE:
-            # Find the move by name (simplified mapping)
+            # Map to actual available moves
             move_mapping = {
                 "Move_A": 0, "Move_B": 1, "Move_C": 2, "Move_D": 3
             }
 
             if action.target in move_mapping and move_mapping[action.target] < len(battle.available_moves):
                 move = battle.available_moves[move_mapping[action.target]]
-                return self.create_order(move, dynamax=action.is_dynamax)
+                # Don't pass dynamax=True since it's not available
+                return self.create_order(move)
             elif battle.available_moves:
-                # Fallback to first available move
-                return self.create_order(battle.available_moves[0], dynamax=action.is_dynamax)
+                # Fallback to best move using your heuristic
+                active = battle.active_pokemon
+                opponent = battle.opponent_active_pokemon
+                physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
+                special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
+
+                best_move = max(
+                    battle.available_moves,
+                    key=lambda m: m.base_power * (1.5 if m.type in active.types else 1) *
+                                  (physical_ratio if m.category == MoveCategory.PHYSICAL else special_ratio) *
+                                  m.accuracy * m.expected_hits * opponent.damage_multiplier(m),
+                )
+                return self.create_order(best_move)
 
         elif action.type == ActionType.SWITCH:
-            # Find pokemon by index
-            switch_mapping = {
-                "Pokemon_0": 0, "Pokemon_1": 1, "Pokemon_2": 2,
-                "Pokemon_3": 3, "Pokemon_4": 4, "Pokemon_5": 5
-            }
+            if battle.available_switches:
+                try:
+                    switch_index = int(action.target.split('_')[1]) if '_' in action.target else 0
+                    if switch_index < len(battle.available_switches):
+                        return self.create_order(battle.available_switches[switch_index])
+                except (ValueError, IndexError):
+                    pass
 
-            if action.target in switch_mapping and switch_mapping[action.target] < len(battle.available_switches):
-                pokemon = battle.available_switches[switch_mapping[action.target]]
-                return self.create_order(pokemon)
-            elif battle.available_switches:
-                # Fallback to first available switch
-                return self.create_order(battle.available_switches[0])
+                # Fallback to best switch
+                opponent = battle.opponent_active_pokemon
+                best_switch = max(
+                    battle.available_switches,
+                    key=lambda s: self._estimate_matchup(s, opponent),
+                )
+                return self.create_order(best_switch)
 
         # Ultimate fallback
-        return self.choose_random_move(battle)
-
+        return self._heuristic_choose_move(battle)
+    
     def _should_use_mcts(self, battle: AbstractBattle) -> bool:
         """Decide when to use MCTS vs heuristic"""
         # Use MCTS for important decisions
