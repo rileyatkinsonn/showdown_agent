@@ -743,25 +743,37 @@ class CustomAgent(Player):
         return score
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Decide when to use Terastallization"""
+        """Aggressive Tera usage for competitive play"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
         if not battle.can_tera or not active or not opponent:
             return False
 
-        # Tera if it flips a bad matchup to good
         current_matchup = self._estimate_matchup(active, opponent)
 
-        # Estimate matchup after tera (simplified)
-        tera_type = active.tera_type
-        if tera_type:
-            # If we're taking super-effective damage, tera might help
-            current_damage = max([active.damage_multiplier(t) for t in opponent.types if t])
-
-            # Rough estimation: if currently weak and tera type resists opponent
-            if current_damage > 1.0 and current_matchup < -0.5:
+        # 1. Emergency defensive Tera when taking super-effective damage
+        if active.current_hp_fraction < 0.6:
+            damage_taken = max([active.damage_multiplier(t) for t in opponent.types if t])
+            if damage_taken > 1.0:  # Taking super-effective damage
                 return True
+
+        # 2. Offensive Tera when healthy and can potentially KO
+        if (active.current_hp_fraction > 0.7 and
+                opponent.current_hp_fraction < 0.5 and
+                current_matchup > 0):
+            return True
+
+        # 3. Tera when setting up (Calm Mind, Swords Dance, etc.)
+        if (active.current_hp_fraction >= 0.8 and
+                current_matchup > 0.5 and
+                any(move.boosts and sum(move.boosts.values()) >= 2
+                    for move in battle.available_moves)):
+            return True
+
+        # 4. Desperate Tera when in really bad matchup
+        if current_matchup < -2.0:
+            return True
 
         return False
 
@@ -789,30 +801,25 @@ class CustomAgent(Player):
         return False
 
     def _should_switch_out(self, battle: AbstractBattle):
+        """Enhanced switch logic with anti-spam protection"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
         # NEVER switch if you just switched in (anti-switching spam)
-        if battle.turn <= 1 or getattr(self, '_last_switched_turn', -2) >= battle.turn - 1:
+        if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 1:
             return False
+
         # If there is a decent switch in...
-        if [
-            m
-            for m in battle.available_switches
-            if self._estimate_matchup(m, opponent) > 0
-        ]:
+        if [m for m in battle.available_switches if self._estimate_matchup(m, opponent) > 0]:
             # ...and a 'good' reason to switch out
             if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
+                self._last_switched_turn = battle.turn
                 return True
-            if (
-                    active.boosts["atk"] <= -3
-                    and active.stats["atk"] >= active.stats["spa"]
-            ):
+            if (active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]):
+                self._last_switched_turn = battle.turn
                 return True
-            if (
-                    active.boosts["spa"] <= -3
-                    and active.stats["atk"] <= active.stats["spa"]
-            ):
+            if (active.boosts["spa"] <= -3 and active.stats["atk"] <= active.stats["spa"]):
+                self._last_switched_turn = battle.turn
                 return True
             if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
                 self._last_switched_turn = battle.turn
@@ -997,13 +1004,22 @@ class CustomAgent(Player):
         return False
 
     def _heuristic_choose_move(self, battle: AbstractBattle):
-        """Your original choose_move logic with Tera support"""
+        """Enhanced heuristic with priorities, better Tera, and anti-switching logic"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
         # Check if we should tera (do this once at the start)
         should_tera = self._should_terastallize(battle)
 
+        # PRIORITY 1: If opponent is low HP, go for immediate KO
+        if opponent.current_hp_fraction < 0.35 and battle.available_moves:
+            best_attack = max(
+                battle.available_moves,
+                key=lambda m: m.base_power * opponent.damage_multiplier(m) * m.accuracy * m.expected_hits
+            )
+            return self.create_order(best_attack, terastallize=should_tera)
+
+        # Calculate damage ratios for later use
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(
             opponent, "def"
         )
@@ -1021,9 +1037,18 @@ class CustomAgent(Player):
                 [m for m in battle.opponent_team.values() if m.fainted is True]
             )
 
-            # Entry hazard...
+            # PRIORITY 2: Early Spikes setup (enhanced conditions)
+            if (n_opp_remaining_mons >= 4 and
+                    active.species == "deoxys-speed" and
+                    active.current_hp_fraction > 0.5):
+                for move in battle.available_moves:
+                    if (move.id == "spikes" and
+                            SideCondition.SPIKES not in battle.opponent_side_conditions):
+                        return self.create_order(move, terastallize=should_tera)
+
+            # PRIORITY 3: Entry hazard setup/removal (existing logic)
             for move in battle.available_moves:
-                # ...setup
+                # Hazard setup
                 if (
                         n_opp_remaining_mons >= 3
                         and move.id in self.ENTRY_HAZARDS
@@ -1032,7 +1057,7 @@ class CustomAgent(Player):
                 ):
                     return self.create_order(move, terastallize=should_tera)
 
-                # ...removal
+                # Hazard removal
                 elif (
                         battle.side_conditions
                         and move.id in self.ANTI_HAZARDS_MOVES
@@ -1040,10 +1065,10 @@ class CustomAgent(Player):
                 ):
                     return self.create_order(move, terastallize=should_tera)
 
-            # Setup moves
+            # PRIORITY 4: Setup moves (enhanced conditions)
             if (
-                    active.current_hp_fraction == 1
-                    and self._estimate_matchup(active, opponent) > 0
+                    active.current_hp_fraction >= 0.8  # Safer HP threshold
+                    and self._estimate_matchup(active, opponent) > 0.5  # Better matchup required
             ):
                 for move in battle.available_moves:
                     if (
@@ -1057,6 +1082,7 @@ class CustomAgent(Player):
                     ):
                         return self.create_order(move, terastallize=should_tera)
 
+            # PRIORITY 5: Best attacking move
             move = max(
                 battle.available_moves,
                 key=lambda m: m.base_power
@@ -1073,9 +1099,10 @@ class CustomAgent(Player):
             return self.create_order(
                 move,
                 dynamax=self._should_dynamax(battle, n_remaining_mons),
-                terastallize=should_tera  # Add tera to attack moves
+                terastallize=should_tera
             )
 
+        # PRIORITY 6: Switch only if really necessary (with anti-spam protection)
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
             return self.create_order(
@@ -1083,7 +1110,7 @@ class CustomAgent(Player):
                     switches,
                     key=lambda s: self._estimate_matchup(s, opponent),
                 ),
-                terastallize=should_tera  # Add tera to switches
+                terastallize=should_tera
             )
 
         return self.choose_random_move(battle)
