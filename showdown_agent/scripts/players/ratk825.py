@@ -5,6 +5,9 @@ from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
+from poke_env.battle import Status
+from poke_env.battle.move_category import MoveCategory
+
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.double_battle import DoubleBattle
 from poke_env.battle.move_category import MoveCategory
@@ -460,29 +463,23 @@ class DamageCalculator:
     def estimate_damage(self, action: Action, state: GameState) -> float:
         if action.type != ActionType.MOVE:
             return 0.0
-
         if not action.target:
-            return 0.1  # fallback value
+            return 0.1
 
         move_id = self._normalize_move_id(action.target)
-        if not move_id:
-            return 0.1  # fallback for unparseable move
-
+        move = None
         try:
             move = self.gen_data.moves.get(move_id)
         except Exception:
-            return 0.1  # unknown move, assume weak
-
+            return 0.1
         if not move:
-            return 0.1  # move not found in database
+            return 0.1
 
         base_power = move.base_power or 50
         move_type = move.type or "normal"
-        attacker_name = state.my_active.lower()
-        defender_name = state.opp_active.lower()
 
-        attacker_types = self._guess_types(attacker_name)
-        defender_types = self._guess_types(defender_name)
+        attacker_types = self._guess_types(state.my_active.lower())
+        defender_types = self._guess_types(state.opp_active.lower())
 
         stab = 1.5 if move_type in attacker_types else 1.0
 
@@ -491,10 +488,19 @@ class DamageCalculator:
             try:
                 effectiveness *= self.gen_data.type_chart[move_type].damage_multiplier(def_type)
             except Exception:
-                continue
+                pass
 
-        damage = (base_power / 120.0) * stab * effectiveness
-        return min(1.0, damage)
+        # guessed offensive/defensive stats by category (enum!)
+        if move.category == MoveCategory.PHYSICAL:
+            atk_stat, def_stat = 120, 90
+        elif move.category == MoveCategory.SPECIAL:
+            atk_stat, def_stat = 150, 100
+        else:  # status
+            return 0.05
+
+        modifier = stab * effectiveness
+        raw = ((0.4 * 100 * atk_stat / max(1, def_stat)) * base_power / 50 + 2) * modifier
+        return min(1.0, raw / 300.0)  # normalize to [0,1]
 
     def _normalize_move_id(self, move: str) -> str:
         if not isinstance(move, str):
@@ -758,7 +764,7 @@ class CustomAgent(Player):
 
         self.ENTRY_HAZARDS = {
             "spikes": SideCondition.SPIKES,
-            "stealhrock": SideCondition.STEALTH_ROCK,
+            "stealthrock": SideCondition.STEALTH_ROCK,
             "stickyweb": SideCondition.STICKY_WEB,
             "toxicspikes": SideCondition.TOXIC_SPIKES,
         }
@@ -792,37 +798,60 @@ class CustomAgent(Player):
         return score
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Much more conservative Tera usage"""
         active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        if not battle.can_tera or not active or not opponent:
+        opp = battle.opponent_active_pokemon
+        if not battle.can_tera or not active or not opp:
             return False
 
-        current_matchup = self._estimate_matchup(active, opponent)
+        # Never blind Tera early unless it's saving you from SE damage
+        if battle.turn <= 3:
+            # Only allow if Tera meaningfully improves incoming matchup at low HP
+            cur_eff = max(opp.damage_multiplier(t) for t in active.types if t)
+            new_eff = opp.damage_multiplier(active.tera_type) if active.tera_type else cur_eff
+            return active.current_hp_fraction < 0.4 and cur_eff > 1.0 and new_eff <= 1.0
 
-        # DON'T tera if you're already winning the matchup clearly
-        if current_matchup > 1.5:
+        # Don't Tera if you’re already way ahead in the 1v1
+        if self._estimate_matchup(active, opp) > 1.5:
             return False
 
-        # Only tera in emergencies or for guaranteed KOs
-        # 1. Emergency: Taking super-effective damage and low HP
-        if (active.current_hp_fraction < 0.4 and
-                max([active.damage_multiplier(t) for t in opponent.types if t]) > 1.0):
+        # Don’t throw away better natural resistances
+        if active.tera_type:
+            cur_best = min(opp.damage_multiplier(t) for t in active.types if t)
+            new_eff = opp.damage_multiplier(active.tera_type)
+            if new_eff > cur_best and active.current_hp_fraction > 0.5:
+                return False
+
+        # Emergency defensive Tera
+        cur_worst = max(opp.damage_multiplier(t) for t in active.types if t)
+        new_eff = opp.damage_multiplier(active.tera_type) if active.tera_type else cur_worst
+        if active.current_hp_fraction < 0.5 and cur_worst > 1.0 and new_eff <= 1.0:
             return True
 
-        # 2. Guaranteed KO opportunity
-        if (opponent.current_hp_fraction < 0.3 and
-                current_matchup < 0 and  # Currently losing matchup
-                active.current_hp_fraction > 0.6):  # We're healthy
+        # Secure KO or swing: if opponent is low, Tera for damage/resist flip
+        if (opp.current_hp_fraction < 0.35 and
+                self._estimate_matchup(active, opp) <= 0 and
+                active.current_hp_fraction > 0.6 and
+                new_eff < cur_worst):
             return True
 
-        # 3. Setup behind substitute/when completely safe
+        # Safe setup window
         if (active.current_hp_fraction > 0.9 and
-                opponent.current_hp_fraction < 0.5 and
-                any(move.boosts and sum(move.boosts.values()) >= 2
-                    for move in battle.available_moves)):
+                opp.current_hp_fraction < 0.5 and
+                new_eff <= cur_worst and
+                any(m.boosts and sum(m.boosts.values()) >= 2 for m in battle.available_moves)):
             return True
+
+        # Mirror-specific small rules
+        # - Zacian: prefer NOT to Tera Fire Arceus into Close Combat; only Tera if it reduces CC damage
+        if active.species == "Arceus-Fairy" and opp.species.startswith("Zacian"):
+            # Fire Tera is bad vs CC; skip
+            if str(active.tera_type).lower() == "fire":
+                return False
+
+        # - Koraidon: Tera if it flips Dragon/Fighting coverage from SE→NE
+        if opp.species == "Koraidon" and active.tera_type:
+            if (cur_worst > 1.0 and new_eff <= 1.0 and active.current_hp_fraction <= 0.7):
+                return True
 
         return False
 
@@ -850,29 +879,42 @@ class CustomAgent(Player):
         return False
 
     def _should_switch_out(self, battle: AbstractBattle):
-        """Enhanced switch logic with anti-spam protection"""
         active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
+        opp = battle.opponent_active_pokemon
+        if not active or not opp:
+            return False
 
-        # NEVER switch if you just switched in (anti-switching spam)
+        # Anti-switch spam
         if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 1:
             return False
 
-        # If there is a decent switch in...
-        if [m for m in battle.available_switches if self._estimate_matchup(m, opponent) > 0]:
-            # ...and a 'good' reason to switch out
-            if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
+        # RNG traps: stuck frozen or useless
+        if active.status == Status.FRZ and battle.turn >= 3 and battle.available_switches:
+            self._last_switched_turn = battle.turn
+            return True
+
+        # Deoxys-Speed vs Koraidon lead: Focus Sash loses to multihit Scale Shot
+        if (active.species == "Deoxys-Speed" and opp.species == "Koraidon" and
+                battle.turn == 1 and battle.available_switches):
+            self._last_switched_turn = battle.turn
+            return True
+
+        # Massive stat drops
+        if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
+            if battle.available_switches:
                 self._last_switched_turn = battle.turn
                 return True
-            if (active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]):
+        if (active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]) or \
+                (active.boosts["spa"] <= -3 and active.stats["spa"] >= active.stats["atk"]):
+            if battle.available_switches:
                 self._last_switched_turn = battle.turn
                 return True
-            if (active.boosts["spa"] <= -3 and active.stats["atk"] <= active.stats["spa"]):
-                self._last_switched_turn = battle.turn
-                return True
-            if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
-                self._last_switched_turn = battle.turn
-                return True
+
+        # Terrible matchup
+        if self._estimate_matchup(active, opp) < self.SWITCH_OUT_MATCHUP_THRESHOLD and battle.available_switches:
+            self._last_switched_turn = battle.turn
+            return True
+
         return False
 
     def _stat_estimation(self, mon: Pokemon, stat: str):
@@ -1019,38 +1061,6 @@ class CustomAgent(Player):
         # Use your original heuristic as fallback
         # print("Using heuristic decision...")
         return self._heuristic_choose_move(battle)
-
-    def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Aggressive Tera usage for mirrors"""
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        if not battle.can_tera or not active or not opponent:
-            return False
-
-        # Tera early for defensive purposes in bad matchups
-        current_matchup = self._estimate_matchup(active, opponent)
-
-        # 1. Emergency defensive Tera when taking super-effective damage
-        if active.current_hp_fraction < 0.6:
-            damage_taken = max([active.damage_multiplier(t) for t in opponent.types if t])
-            if damage_taken > 1.0:  # Taking super-effective damage
-                return True
-
-        # 2. Offensive Tera when healthy and can KO
-        if (active.current_hp_fraction > 0.7 and
-                opponent.current_hp_fraction < 0.4 and
-                current_matchup > 0):
-            return True
-
-        # 3. Tera when setting up (Calm Mind, Swords Dance)
-        if active.current_hp_fraction == 1.0 and any(
-                move.boosts and sum(move.boosts.values()) >= 2
-                for move in battle.available_moves
-        ):
-            return True
-
-        return False
 
     def _heuristic_choose_move(self, battle: AbstractBattle):
         """Enhanced heuristic with priorities, better Tera, and anti-switching logic"""
