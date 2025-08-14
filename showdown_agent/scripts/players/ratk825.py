@@ -17,6 +17,7 @@ from poke_env.player.battle_order import (
     DoubleBattleOrder,
     SingleBattleOrder,
 )
+from poke_env.data import GenData
 from poke_env.player.player import Player
 from enum import Enum
 from dataclasses import dataclass, field
@@ -329,7 +330,7 @@ class GameStateManager:
     """Enhanced game state manager with real Pokemon logic"""
 
     def __init__(self):
-        self.damage_calculator = SimpleDamageCalculator()
+        self.damage_calculator = DamageCalculator()
 
     def apply_action(self, state: GameState, action: Action) -> GameState:
         """Apply an action and return new state"""
@@ -452,17 +453,56 @@ class GameStateManager:
         return new_state
 
 
-class SimpleDamageCalculator:
-    """Simple damage calculator for MCTS simulation"""
+class DamageCalculator:
+    def __init__(self):
+        self.gen_data = GenData.from_gen(9)
 
     def estimate_damage(self, action: Action, state: GameState) -> float:
-        """Estimate damage as HP percentage"""
-        if action.type == ActionType.MOVE:
-            base_damage = 0.25  # 25% damage for normal moves
-            if action.is_dynamax:
-                base_damage = 0.4  # 40% for dynamax moves
-            return base_damage
-        return 0.0  # No damage for switches
+        if action.type != ActionType.MOVE:
+            return 0.0
+
+        move_id = self._normalize_move_id(action.target)
+        move = self.gen_data.moves.get(move_id)
+        if not move:
+            return 0.2  # default low power for unknown moves
+
+        base_power = move.base_power or 50  # fallback if unspecified
+        move_type = move.type
+        move_cat = move.category
+
+        # Rough guess of attacker/defender typing from name
+        attacker_name = state.my_active.lower()
+        defender_name = state.opp_active.lower()
+
+        attacker_types = self._guess_types(attacker_name)
+        defender_types = self._guess_types(defender_name)
+
+        # STAB
+        stab = 1.5 if move_type in attacker_types else 1.0
+
+        # Type effectiveness (multiply effectiveness across both defender types)
+        effectiveness = 1.0
+        for def_type in defender_types:
+            effectiveness *= self.gen_data.type_chart[move_type].damage_multiplier(def_type)
+
+        # Very crude scaling formula (normalized)
+        damage = (base_power / 120) * stab * effectiveness
+        return min(1.0, damage)
+
+    def _normalize_move_id(self, move: str) -> str:
+        return move.lower().replace(" ", "").replace("-", "")
+
+    def _guess_types(self, mon_name: str) -> List[str]:
+        """Very crude typing guesser based on species name"""
+        mapping = {
+            "deoxys-speed": ["psychic"],
+            "kingambit": ["dark", "steel"],
+            "zacian-crowned": ["fairy", "steel"],
+            "arceus-fairy": ["fairy"],
+            "eternatus": ["poison", "dragon"],
+            "koraidon": ["fighting", "dragon"],
+        }
+        return mapping.get(mon_name, ["normal"])
 
 class MCTSAlgorithm:
     """Core MCTS algorithm implementation"""
