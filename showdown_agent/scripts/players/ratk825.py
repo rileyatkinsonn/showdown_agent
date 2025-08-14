@@ -743,7 +743,7 @@ class CustomAgent(Player):
         return score
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Aggressive Tera usage for competitive play"""
+        """Much more conservative Tera usage"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
@@ -752,27 +752,27 @@ class CustomAgent(Player):
 
         current_matchup = self._estimate_matchup(active, opponent)
 
-        # 1. Emergency defensive Tera when taking super-effective damage
-        if active.current_hp_fraction < 0.6:
-            damage_taken = max([active.damage_multiplier(t) for t in opponent.types if t])
-            if damage_taken > 1.0:  # Taking super-effective damage
-                return True
+        # DON'T tera if you're already winning the matchup clearly
+        if current_matchup > 1.5:
+            return False
 
-        # 2. Offensive Tera when healthy and can potentially KO
-        if (active.current_hp_fraction > 0.7 and
-                opponent.current_hp_fraction < 0.5 and
-                current_matchup > 0):
+        # Only tera in emergencies or for guaranteed KOs
+        # 1. Emergency: Taking super-effective damage and low HP
+        if (active.current_hp_fraction < 0.4 and
+                max([active.damage_multiplier(t) for t in opponent.types if t]) > 1.0):
             return True
 
-        # 3. Tera when setting up (Calm Mind, Swords Dance, etc.)
-        if (active.current_hp_fraction >= 0.8 and
-                current_matchup > 0.5 and
+        # 2. Guaranteed KO opportunity
+        if (opponent.current_hp_fraction < 0.3 and
+                current_matchup < 0 and  # Currently losing matchup
+                active.current_hp_fraction > 0.6):  # We're healthy
+            return True
+
+        # 3. Setup behind substitute/when completely safe
+        if (active.current_hp_fraction > 0.9 and
+                opponent.current_hp_fraction < 0.5 and
                 any(move.boosts and sum(move.boosts.values()) >= 2
                     for move in battle.available_moves)):
-            return True
-
-        # 4. Desperate Tera when in really bad matchup
-        if current_matchup < -2.0:
             return True
 
         return False
@@ -951,7 +951,7 @@ class CustomAgent(Player):
         # Decide whether to use MCTS or heuristic
         if self._should_use_mcts(battle):
             try:
-                print("Using MCTS for decision...")
+                # print("Using MCTS for decision...")
                 # Convert battle to abstract state
                 game_state = self._battle_to_gamestate(battle)
 
@@ -960,7 +960,7 @@ class CustomAgent(Player):
 
                 # Convert back to battle order
                 battle_order = self._action_to_battle_order(best_action, battle)
-                print(f"MCTS chose: {best_action}")
+                # print(f"MCTS chose: {best_action}")
                 return battle_order
 
             except Exception as e:
@@ -968,7 +968,7 @@ class CustomAgent(Player):
                 # Fall through to heuristic
 
         # Use your original heuristic as fallback
-        print("Using heuristic decision...")
+        # print("Using heuristic decision...")
         return self._heuristic_choose_move(battle)
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
