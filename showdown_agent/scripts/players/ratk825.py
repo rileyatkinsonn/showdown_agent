@@ -740,6 +740,29 @@ class CustomAgent(Player):
 
         return score
 
+    def _should_terastallize(self, battle: AbstractBattle) -> bool:
+        """Decide when to use Terastallization"""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+
+        if not battle.can_tera or not active or not opponent:
+            return False
+
+        # Tera if it flips a bad matchup to good
+        current_matchup = self._estimate_matchup(active, opponent)
+
+        # Estimate matchup after tera (simplified)
+        tera_type = active.tera_type
+        if tera_type:
+            # If we're taking super-effective damage, tera might help
+            current_damage = max([active.damage_multiplier(t) for t in opponent.types if t])
+
+            # Rough estimation: if currently weak and tera type resists opponent
+            if current_damage > 1.0 and current_matchup < -0.5:
+                return True
+
+        return False
+
     def _should_dynamax(self, battle: AbstractBattle, n_remaining_mons: int):
         if battle.can_dynamax:
             # Last full HP mon
@@ -929,13 +952,38 @@ class CustomAgent(Player):
         print("Using heuristic decision...")
         return self._heuristic_choose_move(battle)
 
-    def _heuristic_choose_move(self, battle: AbstractBattle):
-        """Your original choose_move logic as a separate method"""
+    def _should_terastallize(self, battle: AbstractBattle) -> bool:
+        """Decide when to use Terastallization"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
-        # [Copy your entire original choose_move logic here]
-        # This is all your existing code from "# Rough estimation of damage ratio" onwards
+        if not battle.can_tera or not active or not opponent:
+            return False
+
+        # Tera if it flips a bad matchup to good
+        current_matchup = self._estimate_matchup(active, opponent)
+
+        # If we're in a bad matchup and tera might help
+        if current_matchup < -1.0:  # Bad matchup
+            # Check if we're taking super-effective damage
+            current_damage = max([active.damage_multiplier(t) for t in opponent.types if t])
+            if current_damage > 1.0:  # Taking super-effective damage
+                return True
+
+        # Tera for offensive boost when we have advantage
+        if current_matchup > 1.0 and active.current_hp_fraction > 0.5:
+            return True
+
+        return False
+
+    def _heuristic_choose_move(self, battle: AbstractBattle):
+        """Your original choose_move logic with Tera support"""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+
+        # Check if we should tera (do this once at the start)
+        should_tera = self._should_terastallize(battle)
+
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(
             opponent, "def"
         )
@@ -962,7 +1010,7 @@ class CustomAgent(Player):
                         and self.ENTRY_HAZARDS[move.id]
                         not in battle.opponent_side_conditions
                 ):
-                    return self.create_order(move)
+                    return self.create_order(move, terastallize=should_tera)
 
                 # ...removal
                 elif (
@@ -970,7 +1018,7 @@ class CustomAgent(Player):
                         and move.id in self.ANTI_HAZARDS_MOVES
                         and n_remaining_mons >= 2
                 ):
-                    return self.create_order(move)
+                    return self.create_order(move, terastallize=should_tera)
 
             # Setup moves
             if (
@@ -987,7 +1035,7 @@ class CustomAgent(Player):
                     )
                             < 6
                     ):
-                        return self.create_order(move)
+                        return self.create_order(move, terastallize=should_tera)
 
             move = max(
                 battle.available_moves,
@@ -1003,7 +1051,9 @@ class CustomAgent(Player):
                               * opponent.damage_multiplier(m),
             )
             return self.create_order(
-                move, dynamax=self._should_dynamax(battle, n_remaining_mons)
+                move,
+                dynamax=self._should_dynamax(battle, n_remaining_mons),
+                terastallize=should_tera  # Add tera to attack moves
             )
 
         if battle.available_switches:
@@ -1012,7 +1062,8 @@ class CustomAgent(Player):
                 max(
                     switches,
                     key=lambda s: self._estimate_matchup(s, opponent),
-                )
+                ),
+                terastallize=should_tera  # Add tera to switches
             )
 
         return self.choose_random_move(battle)
