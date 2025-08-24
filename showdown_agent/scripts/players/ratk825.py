@@ -1,4 +1,3 @@
-import random
 import time
 import math
 from typing import List, Optional, Dict, Tuple
@@ -784,18 +783,228 @@ class CustomAgent(Player):
 
         self._last_switched_turn = -2
 
-    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
-        score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
-        score -= max(
-            [mon.damage_multiplier(t) for t in opponent.types if t is not None]
-        )
+        # Team composition mapping (will be populated dynamically)
+        self._team_species_to_role = {}
+        self._opponent_species_to_role = {}
+
+        # Load move and Pokemon data
+        self._gen_data = None
+
+    def _get_gen_data(self, battle: AbstractBattle):
+        """Get GenData for this battle"""
+        if self._gen_data is None:
+            self._gen_data = GenData.from_gen(battle.gen)
+        return self._gen_data
+
+    def _get_lead_pokemon_species(self, battle: AbstractBattle) -> str:
+        """Determine the best lead Pokemon species based on team composition"""
+        gen_data = self._get_gen_data(battle)
+
+        # Prefer fast setup Pokemon with hazard-setting moves
+        priority_leads = []
+
+        for pokemon in battle.team.values():
+            species_data = gen_data.pokedex.get(pokemon.species.replace("-", "").lower())
+            if not species_data:
+                continue
+
+            # Check if Pokemon has hazard-setting moves
+            has_hazard_moves = any(
+                move_id in self.ENTRY_HAZARDS
+                for move_id in pokemon.moves.keys() if pokemon.moves
+            )
+
+            # Prioritize fast Pokemon with setup moves
+            if species_data.get("baseStats", {}).get("spe", 0) >= 150 and has_hazard_moves:
+                priority_leads.append(pokemon.species)
+
+        # Fallback to fastest Pokemon
+        if not priority_leads:
+            fastest_pokemon = max(
+                battle.team.values(),
+                key=lambda p: gen_data.pokedex.get(p.species.replace("-", "").lower(), {})
+                .get("baseStats", {}).get("spe", 0)
+            )
+            return fastest_pokemon.species
+
+        return priority_leads[0]
+
+    def _get_type_effectiveness(self, attacking_type: str, defending_types: List[str], battle: AbstractBattle) -> float:
+        """Calculate type effectiveness using GenData"""
+        gen_data = self._get_gen_data(battle)
+
+        if not attacking_type or not defending_types:
+            return 1.0
+
+        effectiveness = 1.0
+        attacking_type_upper = attacking_type.upper()
+
+        for defending_type in defending_types:
+            if defending_type:
+                defending_type_upper = defending_type.upper()
+                try:
+                    # GenData stores effectiveness from attacking type perspective
+                    type_matchup = gen_data.type_chart.get(defending_type_upper, {})
+                    effectiveness *= type_matchup.get(attacking_type_upper, 1.0)
+                except (KeyError, AttributeError):
+                    pass
+
+        return effectiveness
+
+    def _get_pokemon_types(self, pokemon: Pokemon, battle: AbstractBattle) -> List[str]:
+        """Get Pokemon types using GenData"""
+        gen_data = self._get_gen_data(battle)
+
+        # Use actual types if available
+        if hasattr(pokemon, 'types') and pokemon.types:
+            return [t.name.lower() if hasattr(t, 'name') else str(t).lower() for t in pokemon.types if t]
+
+        # Fallback to pokedex data
+        species_data = gen_data.pokedex.get(pokemon.species.replace("-", "").lower())
+        if species_data and "types" in species_data:
+            return [t.lower() for t in species_data["types"]]
+
+        return ["normal"]  # Ultimate fallback
+
+    def _is_setup_move(self, move_name: str, battle: AbstractBattle) -> bool:
+        """Check if a move is a setup move using GenData"""
+        gen_data = self._get_gen_data(battle)
+        move_id = move_name.lower().replace(" ", "").replace("-", "")
+
+        move_data = gen_data.moves.get(move_id)
+        if not move_data:
+            return False
+
+        # Check if move has stat boosts for self
+        boosts = move_data.get("boosts")
+        if boosts and move_data.get("target") == "self":
+            boost_total = sum(boosts.values()) if isinstance(boosts, dict) else 0
+            return boost_total >= 2
+
+        return False
+
+    def _get_move_power(self, move_name: str, battle: AbstractBattle) -> int:
+        """Get move base power using GenData"""
+        gen_data = self._get_gen_data(battle)
+        move_id = move_name.lower().replace(" ", "").replace("-", "")
+
+        move_data = gen_data.moves.get(move_id)
+        if move_data:
+            return move_data.get("basePower", 0) or 0
+        return 0
+
+    def _get_move_type(self, move_name: str, battle: AbstractBattle) -> str:
+        """Get move type using GenData"""
+        gen_data = self._get_gen_data(battle)
+        move_id = move_name.lower().replace(" ", "").replace("-", "")
+
+        move_data = gen_data.moves.get(move_id)
+        if move_data:
+            return move_data.get("type", "normal").lower()
+        return "normal"
+
+    def _get_critical_matchups(self, my_species: str, opp_species: str, battle: AbstractBattle) -> dict:
+        """Identify critical bad matchups using type data"""
+        gen_data = self._get_gen_data(battle)
+
+        my_data = gen_data.pokedex.get(my_species.replace("-", "").lower(), {})
+        opp_data = gen_data.pokedex.get(opp_species.replace("-", "").lower(), {})
+
+        my_types = my_data.get("types", ["Normal"])
+        opp_types = opp_data.get("types", ["Normal"])
+
+        # Check defensive disadvantage (how much damage we take)
+        defensive_multiplier = 1.0
+        for opp_type in opp_types:
+            effectiveness = self._get_type_effectiveness(opp_type, my_types, battle)
+            defensive_multiplier = max(defensive_multiplier, effectiveness)
+
+        # Check offensive disadvantage (how much damage we deal)
+        offensive_multiplier = 1.0
+        for my_type in my_types:
+            effectiveness = self._get_type_effectiveness(my_type, opp_types, battle)
+            offensive_multiplier = max(offensive_multiplier, effectiveness)
+
+        return {
+            "defensive_weakness": defensive_multiplier > 1.5,
+            "offensive_resistance": offensive_multiplier < 0.75,
+            "critical_bad": defensive_multiplier > 1.5 and offensive_multiplier < 0.75,
+            "defensive_multiplier": defensive_multiplier,
+            "offensive_multiplier": offensive_multiplier
+        }
+
+    def _find_best_counter(self, target_species: str, battle: AbstractBattle) -> Optional[Pokemon]:
+        """Find the best counter to a specific Pokemon using type effectiveness"""
+        if not battle.available_switches:
+            return None
+
+        best_counter = None
+        best_score = -999
+
+        for switch_pokemon in battle.available_switches:
+            matchup_data = self._get_critical_matchups(
+                switch_pokemon.species, target_species, battle
+            )
+
+            # Score based on defensive advantage and offensive effectiveness
+            score = 0
+            if matchup_data["defensive_multiplier"] <= 0.5:  # Resists opponent's attacks
+                score += 3
+            elif matchup_data["defensive_multiplier"] <= 1.0:  # Neutral defense
+                score += 1
+            elif matchup_data["defensive_multiplier"] >= 2.0:  # Weak to opponent
+                score -= 3
+
+            if matchup_data["offensive_multiplier"] >= 2.0:  # Super effective vs opponent
+                score += 2
+            elif matchup_data["offensive_multiplier"] >= 1.0:  # Neutral offense
+                score += 1
+
+            # Consider HP
+            score += switch_pokemon.current_hp_fraction * 2
+
+            if score > best_score:
+                best_score = score
+                best_counter = switch_pokemon
+
+        return best_counter
+
+    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon, battle: AbstractBattle = None):
+        """Enhanced matchup estimation using GenData"""
+        if battle is None:
+            # Fallback to original logic if no battle context
+            score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
+            score -= max(
+                [mon.damage_multiplier(t) for t in opponent.types if t is not None]
+            )
+            if mon.base_stats["spe"] > opponent.base_stats["spe"]:
+                score += self.SPEED_TIER_COEFICIENT
+            elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
+                score -= self.SPEED_TIER_COEFICIENT
+
+            score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
+            score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
+            return score
+
+        # Enhanced matchup using GenData
+        matchup_data = self._get_critical_matchups(mon.species, opponent.species, battle)
+
+        # Base score from type effectiveness
+        score = matchup_data["offensive_multiplier"] - matchup_data["defensive_multiplier"]
+
+        # Speed tier consideration
         if mon.base_stats["spe"] > opponent.base_stats["spe"]:
             score += self.SPEED_TIER_COEFICIENT
         elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
             score -= self.SPEED_TIER_COEFICIENT
 
+        # HP consideration
         score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
+
+        # Critical bad matchup penalty
+        if matchup_data["critical_bad"]:
+            score -= 1.0
 
         return score
 
@@ -846,7 +1055,7 @@ class CustomAgent(Player):
                 if battle.available_switches and battle.turn > 1:
                     best_switch = max(
                         battle.available_switches,
-                        key=lambda s: self._estimate_matchup(s, opponent)
+                        key=lambda s: self._estimate_matchup(s, opponent, battle)
                     )
                     return self.create_order(best_switch)
 
@@ -988,8 +1197,18 @@ class CustomAgent(Player):
         if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 2:
             return False
 
-        # Emergency switches (immediate threats)
-        current_matchup = self._estimate_matchup(active, opp)
+        # CRITICAL BAD MATCHUPS using GenData
+        matchup_data = self._get_critical_matchups(active.species, opp.species, battle)
+
+        if matchup_data["critical_bad"] and battle.available_switches:
+            # Find the best counter using type effectiveness
+            best_counter = self._find_best_counter(opp.species, battle)
+            if best_counter and best_counter.current_hp_fraction > 0.7:
+                self._last_switched_turn = battle.turn
+                return best_counter
+
+        # Emergency switches for severe disadvantages
+        current_matchup = self._estimate_matchup(active, opp, battle)
 
         # If we're in a terrible matchup and opponent can likely KO us
         if (current_matchup < -2.0 and
@@ -1000,11 +1219,11 @@ class CustomAgent(Player):
             if battle.available_switches:
                 best_switch = max(
                     battle.available_switches,
-                    key=lambda s: self._estimate_matchup(s, opp)
+                    key=lambda s: self._estimate_matchup(s, opp, battle)
                 )
 
                 # Only switch if the switch-in is significantly better
-                if self._estimate_matchup(best_switch, opp) > current_matchup + 1.0:
+                if self._estimate_matchup(best_switch, opp, battle) > current_matchup + 1.0:
                     self._last_switched_turn = battle.turn
                     return best_switch
 
@@ -1013,32 +1232,21 @@ class CustomAgent(Player):
             self._last_switched_turn = battle.turn
             return True
 
-        # Deoxys-Speed vs Koraidon lead: Focus Sash loses to multihit Scale Shot
-        if (active.species == "Deoxys-Speed" and opp.species == "Koraidon" and
-                battle.turn == 1 and battle.available_switches):
-            # Switch to our best counter
-            for switch in battle.available_switches:
-                if switch.species == "Arceus-Fairy":  # Resists both STABs
-                    self._last_switched_turn = battle.turn
-                    return switch
+        # Fast Pokemon vs slow setup sweepers - check using base stats
+        gen_data = self._get_gen_data(battle)
+        active_data = gen_data.pokedex.get(active.species.replace("-", "").lower(), {})
+        opp_data = gen_data.pokedex.get(opp.species.replace("-", "").lower(), {})
 
-        # Deoxys-Speed specific: Switch out against setup sweepers
-        if (active.species == "Deoxys-Speed" and
-                opp.species in ["Koraidon", "Zacian-Crowned"] and
-                active.current_hp_fraction < 0.8):
+        # If we're a fast support Pokemon vs a slow powerful setup sweeper
+        if (active_data.get("baseStats", {}).get("spe", 0) >= 150 and
+                opp_data.get("baseStats", {}).get("spe", 0) <= 100 and
+                opp_data.get("baseStats", {}).get("atk", 0) >= 120 and
+                active.current_hp_fraction < 0.8 and battle.available_switches):
 
-            # Switch to our best counter
-            counter_map = {
-                "Koraidon": "Arceus-Fairy",  # Resists both STABs
-                "Zacian-Crowned": "Eternatus"  # Can trade hits
-            }
-
-            target_species = counter_map.get(opp.species)
-            if target_species and battle.available_switches:
-                for switch in battle.available_switches:
-                    if switch.species == target_species:
-                        self._last_switched_turn = battle.turn
-                        return switch
+            best_counter = self._find_best_counter(opp.species, battle)
+            if best_counter:
+                self._last_switched_turn = battle.turn
+                return best_counter
 
         # Massive stat drops
         if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
@@ -1052,7 +1260,8 @@ class CustomAgent(Player):
                 return True
 
         # Terrible matchup (original logic)
-        if self._estimate_matchup(active, opp) < self.SWITCH_OUT_MATCHUP_THRESHOLD and battle.available_switches:
+        if self._estimate_matchup(active, opp,
+                                  battle) < self.SWITCH_OUT_MATCHUP_THRESHOLD and battle.available_switches:
             self._last_switched_turn = battle.turn
             return True
 
@@ -1134,7 +1343,7 @@ class CustomAgent(Player):
                 opponent = battle.opponent_active_pokemon
                 best_switch = max(
                     battle.available_switches,
-                    key=lambda s: self._estimate_matchup(s, opponent),
+                    key=lambda s: self._estimate_matchup(s, opponent, battle),
                 )
                 return self.create_order(best_switch)
 
@@ -1172,6 +1381,14 @@ class CustomAgent(Player):
         if not battle.active_pokemon or not battle.opponent_active_pokemon:
             return self.choose_random_move(battle)
 
+        # CRITICAL: Force best lead Pokemon on turn 1
+        if battle.turn == 1:
+            ideal_lead = self._get_lead_pokemon_species(battle)
+            if battle.active_pokemon.species != ideal_lead and battle.available_switches:
+                for switch in battle.available_switches:
+                    if switch.species == ideal_lead:
+                        return self.create_order(switch)
+
         # Check for mirror match first
         if self._is_mirror_match(battle):
             mirror_order = self._mirror_match_strategy(battle)
@@ -1185,7 +1402,7 @@ class CustomAgent(Player):
         elif should_switch == True and battle.available_switches:  # If it returns True but no specific Pokemon
             best_switch = max(
                 battle.available_switches,
-                key=lambda s: self._estimate_matchup(s, battle.opponent_active_pokemon)
+                key=lambda s: self._estimate_matchup(s, battle.opponent_active_pokemon, battle)
             )
             return self.create_order(best_switch)
 
@@ -1243,55 +1460,40 @@ class CustomAgent(Player):
                 [m for m in battle.opponent_team.values() if m.fainted is True]
             )
 
-            # PRIORITY 2: Early Spikes setup (enhanced conditions)
+            # PRIORITY 2: CRITICAL HAZARD MANAGEMENT
+            # Remove hazards if we're taking significant damage
+            if battle.side_conditions and n_remaining_mons >= 2:
+                for move in battle.available_moves:
+                    if move.id in self.ANTI_HAZARDS_MOVES:
+                        return self.create_order(move, terastallize=should_tera)
+
+            # Set hazards only if opponent doesn't have them and we can safely do it
             if (n_opp_remaining_mons >= 4 and
                     active.species == "Deoxys-Speed" and
-                    active.current_hp_fraction > 0.5):
+                    active.current_hp_fraction > 0.5 and
+                    not battle.opponent_side_conditions):
                 for move in battle.available_moves:
                     if (move.id == "spikes" and
                             SideCondition.SPIKES not in battle.opponent_side_conditions):
                         return self.create_order(move, terastallize=should_tera)
-
-            # PRIORITY 3: Entry hazard setup/removal (existing logic)
-            for move in battle.available_moves:
-                # Hazard setup
-                if (
-                        n_opp_remaining_mons >= 3
-                        and move.id in self.ENTRY_HAZARDS
-                        and self.ENTRY_HAZARDS[move.id]
-                        not in battle.opponent_side_conditions
-                ):
-                    return self.create_order(move, terastallize=should_tera)
-
-                # Hazard removal
-                elif (
-                        battle.side_conditions
-                        and move.id in self.ANTI_HAZARDS_MOVES
-                        and n_remaining_mons >= 2
-                ):
-                    return self.create_order(move, terastallize=should_tera)
-
-            # PRIORITY 4: Setup moves (enhanced conditions)
-            setup_hp_threshold = 0.6 if self._is_mirror_match(battle) else 0.8
-            setup_matchup_threshold = 0.3 if self._is_mirror_match(battle) else 0.5
-
-            if (
-                    active.current_hp_fraction >= setup_hp_threshold
-                    and self._estimate_matchup(active, opponent) > setup_matchup_threshold
-            ):
-                for move in battle.available_moves:
-                    if (
-                            move.boosts
-                            and sum(move.boosts.values()) >= 2
-                            and move.target == "self"
-                            and min(
-                        [active.boosts[s] for s, v in move.boosts.items() if v > 0]
-                    )
-                            < 6
-                    ):
+                    elif (move.id == "stealthrock" and
+                          SideCondition.STEALTH_ROCK not in battle.opponent_side_conditions):
                         return self.create_order(move, terastallize=should_tera)
 
-            # PRIORITY 5: Best attacking move
+            # PRIORITY 3: Setup moves (enhanced conditions)
+            setup_hp_threshold = 0.7 if self._is_mirror_match(battle) else 0.8
+            setup_matchup_threshold = 0.5 if self._is_mirror_match(battle) else 0.5
+
+            if (active.current_hp_fraction >= setup_hp_threshold and
+                    self._estimate_matchup(active, opponent) > setup_matchup_threshold and
+                    n_remaining_mons >= 3):  # Don't setup in endgame
+                for move in battle.available_moves:
+                    if (move.boosts and sum(move.boosts.values()) >= 2 and
+                            move.target == "self" and
+                            min([active.boosts[s] for s, v in move.boosts.items() if v > 0]) < 6):
+                        return self.create_order(move, terastallize=should_tera)
+
+            # PRIORITY 4: Best attacking move
             move = max(
                 battle.available_moves,
                 key=lambda m: m.base_power
@@ -1311,7 +1513,7 @@ class CustomAgent(Player):
                 terastallize=should_tera
             )
 
-        # PRIORITY 6: Switch only if really necessary (with anti-spam protection)
+        # PRIORITY 5: Switch only if really necessary (with anti-spam protection)
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
             return self.create_order(
