@@ -1,30 +1,17 @@
 import random
 import time
 import math
-from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
-from enum import Enum
+from typing import List, Optional, Dict, Set
+from dataclasses import dataclass, field
 
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.double_battle import DoubleBattle
-from poke_env.battle.move_category import MoveCategory
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
-from poke_env.battle.target import Target
-from poke_env.player.battle_order import (
-    BattleOrder,
-    DefaultBattleOrder,
-    DoubleBattleOrder,
-    SingleBattleOrder,
-)
-from poke_env.data import GenData
+from poke_env.player.battle_order import BattleOrder
 from poke_env.player.player import Player
-from enum import Enum
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union, Tuple
-from abc import ABC, abstractmethod
-import random
-import math
+from poke_env.data import GenData
 
 team = """
 Deoxys-Speed @ Focus Sash  
@@ -91,1020 +78,360 @@ Jolly Nature
 - Close Combat  
 """
 
-class PlayerType(Enum):
-    MAX = "MAX"  # Our turn
-    MIN = "MIN"  # Opponent's turn
-    CHANCE = "CHANCE"  # Random events
-
-
-class ActionType(Enum):
-    MOVE = "MOVE"
-    SWITCH = "SWITCH"
-
 
 @dataclass
-class Action:
-    """Represents a single game action"""
-    type: ActionType
-    target: str  # move name or pokemon name
-    is_tera: bool = False
-
-    def __str__(self):
-        prefix = "TERA_" if self.is_tera else ""
-        return f"{prefix}{self.type.value}_{self.target}"
-
-
-@dataclass
-class GameState:
-    """Represents complete game state"""
-    my_active: str  # "Pokemon_X"
-    opp_active: str  # "Pokemon_Y"
-    my_team_hp: List[float]  # [1.0, 0.8, 1.0, 0.0, 1.0]
-    opp_team_hp: List[float]
-    turn_number: int
-    field_conditions: Dict[str, bool] = field(default_factory=dict)
-
-    def __hash__(self):
-        return hash((self.my_active, self.opp_active, tuple(self.my_team_hp),
-                     tuple(self.opp_team_hp), self.turn_number))
+class OpponentPokemon:
+    """Tracks what we know about an opponent's Pokemon"""
+    species: str
+    types: List[str] = field(default_factory=list)
+    moves_seen: Set[str] = field(default_factory=set)
+    ability: Optional[str] = None
+    item: Optional[str] = None
+    current_hp_fraction: float = 1.0
+    is_alive: bool = True
+    status: Optional[str] = None
+    
+    def add_move(self, move_id: str):
+        self.moves_seen.add(move_id)
+    
+    def update_hp(self, hp_fraction: float):
+        self.current_hp_fraction = hp_fraction
+        if hp_fraction <= 0:
+            self.is_alive = False
 
 
-@dataclass
-class TreeNode:
-    """Base class for all tree nodes"""
-    state: GameState
-    player: PlayerType
-    parent: Optional['TreeNode'] = None
-    children: Dict[str, 'TreeNode'] = field(default_factory=dict)
-
-    # MCTS statistics
-    visits: int = 0
-    total_value: float = 0.0
-
-    @property
-    def average_value(self) -> float:
-        return self.total_value / self.visits if self.visits > 0 else 0.0
-
-    @abstractmethod
-    def get_legal_actions(self) -> List[Union[Action, str]]:
-        """Return legal actions/outcomes for this node"""
-        pass
-
-    @abstractmethod
-    def select_best_child(self, exploration_constant: float = 1.4) -> 'TreeNode':
-        """Select best child using appropriate strategy"""
-        pass
-
-
-class MaxNode(TreeNode):
-    """Node representing our turn (maximizing player)"""
-
-    def __init__(self, state: GameState, parent: Optional[TreeNode] = None):
-        super().__init__(state, PlayerType.MAX, parent)
-        self.untried_actions: List[Action] = self._generate_actions()
-
-    def _generate_actions(self) -> List[Action]:
-        """Generate all possible actions from this state"""
-        actions = []
-        # Add regular moves
-        for move in ["Move_A", "Move_B", "Move_C", "Move_D"]:
-            actions.append(Action(ActionType.MOVE, move))
-            # Add tera versions of moves
-            actions.append(Action(ActionType.MOVE, move, is_tera=True))
-
-        # Add switches
-        for i, hp in enumerate(self.state.my_team_hp):
-            if hp > 0 and i != self._get_active_index():
-                actions.append(Action(ActionType.SWITCH, f"Pokemon_{i}"))
-
-        return actions
-
-    def _get_active_index(self) -> int:
-        """Get index of currently active pokemon"""
-        if '_' in self.state.my_active and self.state.my_active.startswith('Pokemon_'):
-            try:
-                return int(self.state.my_active.split('_')[1])
-            except (ValueError, IndexError):
-                return 0
-        return 0
-
-    def get_legal_actions(self) -> List[Action]:
-        return self.untried_actions
-
-    def select_best_child(self, exploration_constant: float = 1.4) -> 'TreeNode':
-        """UCB1 selection for MAX nodes"""
-        if not self.children:
-            return self
-
-        best_child = None
-        best_value = float('-inf')
-
-        for child in self.children.values():
-            if child.visits == 0:
-                ucb_value = float('inf')
-            else:
-                exploitation = child.average_value
-                exploration = exploration_constant * math.sqrt(
-                    math.log(self.visits) / child.visits
-                )
-                ucb_value = exploitation + exploration
-
-            if ucb_value > best_value:
-                best_value = ucb_value
-                best_child = child
-
-        return best_child
-
-
-class MinNode(TreeNode):
-    """Node representing opponent's turn (minimizing player)"""
-
-    def __init__(self, state: GameState, parent: Optional[TreeNode] = None):
-        super().__init__(state, PlayerType.MIN, parent)
-        self.untried_actions: List[Action] = self._generate_opponent_actions()
-
-    def _generate_opponent_actions(self) -> List[Action]:
-        """Generate opponent's possible actions"""
-        actions = []
-        for move in ["Opp_Move_A", "Opp_Move_B", "Opp_Move_C"]:
-            actions.append(Action(ActionType.MOVE, move))
-            # Add tera versions for opponent too
-            actions.append(Action(ActionType.MOVE, move, is_tera=True))
-
-        # Add opponent switches
-        for i, hp in enumerate(self.state.opp_team_hp):
-            if hp > 0 and i != self._get_opp_active_index():
-                actions.append(Action(ActionType.SWITCH, f"Opp_Pokemon_{i}"))
-
-        return actions
-
-    def _get_opp_active_index(self) -> int:
-        if '_' in self.state.opp_active and self.state.opp_active.startswith(('Pokemon_', 'Opp_Pokemon_')):
-            try:
-                return int(self.state.opp_active.split('_')[-1])
-            except (ValueError, IndexError):
-                return 0
-        return 0
-
-    def get_legal_actions(self) -> List[Action]:
-        return self.untried_actions
-
-    def select_best_child(self, exploration_constant: float = 1.4) -> 'TreeNode':
-        """UCB1 selection for MIN nodes (inverted values)"""
-        if not self.children:
-            return self
-
-        best_child = None
-        best_value = float('-inf')
-
-        for child in self.children.values():
-            if child.visits == 0:
-                ucb_value = float('inf')
-            else:
-                # MIN node wants to minimize our value, so invert
-                exploitation = 1.0 - child.average_value
-                exploration = exploration_constant * math.sqrt(
-                    math.log(self.visits) / child.visits
-                )
-                ucb_value = exploitation + exploration
-
-            if ucb_value > best_value:
-                best_value = ucb_value
-                best_child = child
-
-        return best_child
-
-
-class ChanceNode(TreeNode):
-    """Node representing random events"""
-
-    def __init__(self, state: GameState, action: Action, parent: Optional[TreeNode] = None):
-        super().__init__(state, PlayerType.CHANCE, parent)
-        self.action = action
-        self.outcomes: List[Tuple[str, float]] = self._generate_outcomes()
-
-    def _generate_outcomes(self) -> List[Tuple[str, float]]:
-        """Generate random outcomes with probabilities"""
-        if self.action.type == ActionType.MOVE:
-            return [
-                ("Hit", 0.85),
-                ("Miss", 0.15)
-            ]
-        else:
-            return [("Success", 1.0)]  # Switches always succeed
-
-    def get_legal_actions(self) -> List[str]:
-        return [outcome[0] for outcome in self.outcomes]
-
-    def select_best_child(self, exploration_constant: float = 1.4) -> 'TreeNode':
-        """Random selection weighted by probability"""
-        if not self.children:
-            return self
-
-        # Weight by probability and visit count
-        weights = []
-        for outcome_name, probability in self.outcomes:
-            if outcome_name in self.children:
-                child = self.children[outcome_name]
-                # Encourage exploration of under-visited but probable outcomes
-                weight = probability * (1.0 + 1.0 / (child.visits + 1))
-                weights.append((child, weight))
-
-        if not weights:
-            return self
-
-        # Weighted random selection
-        total_weight = sum(w[1] for w in weights)
-        rand_val = random.uniform(0, total_weight)
-
-        cumulative = 0.0
-        for child, weight in weights:
-            cumulative += weight
-            if rand_val <= cumulative:
-                return child
-
-        return weights[-1][0]  # Fallback
-
-
-class GameStateManager:
-    """Enhanced game state manager with real Pokemon logic"""
-
+class OpponentTracker:
+    """Tracks opponent team and battle state"""
     def __init__(self):
-        self.damage_calculator = DamageCalculator()
-
-    def apply_action(self, state: GameState, action: Action) -> GameState:
-        """Apply an action and return new state"""
-        new_state = GameState(
-            my_active=state.my_active,
-            opp_active=state.opp_active,
-            my_team_hp=state.my_team_hp.copy(),
-            opp_team_hp=state.opp_team_hp.copy(),
-            turn_number=state.turn_number + 1,
-            field_conditions=state.field_conditions.copy()
-        )
-
-        if action.type == ActionType.SWITCH:
-            # Handle switching
-            new_state.my_active = action.target
-
-        elif action.type == ActionType.MOVE:
-            # Simulate damage
-            damage = self.damage_calculator.estimate_damage(action, state)
-            opp_active_idx = self._get_active_index(state.opp_active)
-            if opp_active_idx < len(new_state.opp_team_hp):
-                new_state.opp_team_hp[opp_active_idx] = max(0,
-                                                            state.opp_team_hp[opp_active_idx] - damage)
-
-        return new_state
-
-    def _get_active_index(self, pokemon_name: str) -> int:
-        """Get team index from pokemon name"""
-        # Handle both abstract names (Pokemon_0) and real names (deoxys-speed)
-        if '_' in pokemon_name and pokemon_name.startswith('Pokemon_'):
-            try:
-                return int(pokemon_name.split('_')[1])
-            except (ValueError, IndexError):
-                return 0
-
-        # Handle real pokemon names by mapping to team positions
-        name_to_index = {
-            "deoxys-speed": 0,
-            "kingambit": 1,
-            "zacian-crowned": 2,
-            "arceus-fairy": 3,
-            "eternatus": 4,
-            "koraidon": 5
-        }
-        return name_to_index.get(pokemon_name.lower(), 0)
-
-    def _get_opp_active_index(self, pokemon_name: str) -> int:
-        """Get opponent team index from pokemon name"""
-        if '_' in pokemon_name and pokemon_name.startswith(('Pokemon_', 'Opp_Pokemon_')):
-            try:
-                return int(pokemon_name.split('_')[-1])  # Get last part after splitting
-            except (ValueError, IndexError):
-                return 0
-
-        # For real opponent pokemon names, we don't know their team order exactly
-        # so just return 0 as default (this is a limitation of the abstraction)
-        return 0
-
-    def is_terminal(self, state: GameState) -> bool:
-        """Check if game is over"""
-        my_alive = sum(1 for hp in state.my_team_hp if hp > 0)
-        opp_alive = sum(1 for hp in state.opp_team_hp if hp > 0)
-        return my_alive == 0 or opp_alive == 0
-
-    def evaluate_state(self, state: GameState) -> float:
-        """Evaluate position with heavy switch penalty"""
-        if self.is_terminal(state):
-            my_alive = sum(1 for hp in state.my_team_hp if hp > 0)
-            return 1.0 if my_alive > 0 else 0.0
-
-        # Team count advantage
-        my_count = sum(1 for hp in state.my_team_hp if hp > 0)
-        opp_count = sum(1 for hp in state.opp_team_hp if hp > 0)
-
-        if my_count + opp_count == 0:
-            return 0.5
-
-        team_score = my_count / (my_count + opp_count)
-
-        # HP advantage
-        my_hp = sum(state.my_team_hp)
-        opp_hp = sum(state.opp_team_hp)
-        hp_score = my_hp / (my_hp + opp_hp) if (my_hp + opp_hp) > 0 else 0.5
-
-        # Heavy penalty for having low HP active Pokemon (discourages switching)
-        active_hp_penalty = 0.0
-        if len(state.my_team_hp) > 0:
-            # Assume active is first in list for now
-            active_hp = state.my_team_hp[0]
-            if active_hp < 0.5:
-                active_hp_penalty = 0.1  # Penalty for low HP active
-
-        return 0.8 * team_score + 0.2 * hp_score - active_hp_penalty
-
-    def apply_chance_outcome(self, state: GameState, outcome: str) -> GameState:
-        """Apply a chance outcome to state"""
-        # For now, just return the state unchanged
-        # Later we can add specific logic for different outcomes
-        return state
-
-    def apply_action_with_outcome(self, state: GameState, action: Action, outcome: str) -> GameState:
-        """Apply action with specific random outcome"""
-        new_state = self.apply_action(state, action)
-
-        # Modify based on outcome
-        if outcome == "Miss" and action.type == ActionType.MOVE:
-            # Move missed - no damage dealt, just return state without damage
-            return GameState(
-                my_active=new_state.my_active,
-                opp_active=new_state.opp_active,
-                my_team_hp=state.my_team_hp.copy(),  # Use original HP (no damage)
-                opp_team_hp=state.opp_team_hp.copy(),  # Use original HP (no damage)
-                turn_number=new_state.turn_number,
-                field_conditions=new_state.field_conditions
+        self.known_pokemon: Dict[str, OpponentPokemon] = {}
+        self.team_preview_seen: Set[str] = set()
+        self.active_pokemon_history: List[str] = []
+        
+    def add_pokemon(self, species: str, pokemon: Pokemon = None):
+        """Add a new Pokemon to our knowledge"""
+        if species not in self.known_pokemon:
+            types = [str(t) for t in pokemon.types] if pokemon and pokemon.types else []
+            self.known_pokemon[species] = OpponentPokemon(
+                species=species,
+                types=types,
+                current_hp_fraction=pokemon.current_hp_fraction if pokemon else 1.0,
+                is_alive=not pokemon.fainted if pokemon else True,
+                status=pokemon.status.name if pokemon and pokemon.status else None
             )
-        elif outcome == "Hit" and action.type == ActionType.MOVE:
-            # Move hit - damage was already applied in apply_action
-            return new_state
-
-        return new_state
-
-
-class DamageCalculator:
-    def __init__(self):
-        self.gen_data = GenData.from_gen(9)
-
-    def estimate_damage(self, action: Action, state: GameState) -> float:
-        if action.type != ActionType.MOVE:
-            return 0.0
-
-        if not action.target:
-            return 0.1  # fallback value
-
-        move_id = self._normalize_move_id(action.target)
-        if not move_id:
-            return 0.1  # fallback for unparseable move
-
-        try:
-            move = self.gen_data.moves.get(move_id)
-        except Exception:
-            return 0.1  # unknown move, assume weak
-
-        if not move:
-            return 0.1  # move not found in database
-
-        base_power = move.base_power or 50
-        move_type = move.type or "normal"
-        attacker_name = state.my_active.lower()
-        defender_name = state.opp_active.lower()
-
-        attacker_types = self._guess_types(attacker_name)
-        defender_types = self._guess_types(defender_name)
-
-        stab = 1.5 if move_type in attacker_types else 1.0
-
-        effectiveness = 1.0
-        for def_type in defender_types:
-            try:
-                effectiveness *= self.gen_data.type_chart[move_type].damage_multiplier(def_type)
-            except Exception:
-                continue
-
-        damage = (base_power / 120.0) * stab * effectiveness
-        return min(1.0, damage)
-
-    def _normalize_move_id(self, move: str) -> str:
-        return move.lower().replace(" ", "").replace("-", "")
-
-    def _guess_types(self, mon_name: str) -> List[str]:
-        """Very crude typing guesser based on species name"""
-        mapping = {
-            "deoxys-speed": ["psychic"],
-            "kingambit": ["dark", "steel"],
-            "zacian-crowned": ["fairy", "steel"],
-            "arceus-fairy": ["fairy"],
-            "eternatus": ["poison", "dragon"],
-            "koraidon": ["fighting", "dragon"],
-        }
-        return mapping.get(mon_name, ["normal"])
-
-class MCTSAlgorithm:
-    """Core MCTS algorithm implementation"""
-
-    def __init__(self, game_manager: GameStateManager):
-        self.game_manager = game_manager
-        self.exploration_constant = 1.4
-        self.max_simulations = 50
-        self.max_depth = 6  # Can go deeper without time pressure
-        self.min_visits_for_confidence = 50  # Ensure robust decisions
-
-    def search(self, root_state: GameState) -> Action:
-        """Main MCTS search function"""
-        root = MaxNode(root_state)
-
-        for simulation in range(self.max_simulations):
-            # Four phases of MCTS
-            leaf = self._selection(root)
-            expanded_node = self._expansion(leaf)
-            value = self._simulation(expanded_node)
-            self._backpropagation(expanded_node, value)
-
-            # Optional: Early termination if we have high confidence
-            if simulation > 100 and self._has_confident_choice(root):
-                print(f"Early termination at simulation {simulation} - confident choice found")
-                break
-
-        # Select best action
-        return self._select_final_action(root)
-
-    def _selection(self, node: TreeNode) -> TreeNode:
-        """Phase 1: Navigate tree using UCB1 until reaching expandable node"""
-        current = node
-        path_depth = 0
-
-        while (len(current.children) > 0 and
-               len(current.get_legal_actions()) == 0 and
-               path_depth < self.max_depth):
-
-            current = current.select_best_child(self.exploration_constant)
-            path_depth += 1
-
-            if current is None:
-                break
-
-        return current
-
-    def _expansion(self, node: TreeNode) -> TreeNode:
-        """Phase 2: Add new child node if possible"""
-        if self.game_manager.is_terminal(node.state):
-            return node
-
-        # Check if we can expand this node
-        untried_actions = node.get_legal_actions()
-        if not untried_actions:
-            return node
-
-        # Select random untried action
-        action = random.choice(untried_actions)
-        node.untried_actions.remove(action)
-
-        # Create child node based on action and current player
-        if node.player == PlayerType.MAX:
-            child_node = self._create_child_from_max_action(node, action)
-        elif node.player == PlayerType.MIN:
-            child_node = self._create_child_from_min_action(node, action)
-        elif node.player == PlayerType.CHANCE:
-            child_node = self._create_child_from_chance_outcome(node, action)
-
-        # Add to tree
-        action_key = str(action)
-        node.children[action_key] = child_node
-
-        return child_node
-
-    def _create_child_from_max_action(self, parent: MaxNode, action: Action) -> TreeNode:
-        """Create child node after MAX player takes action"""
-        # For now, skip chance nodes and go directly to deterministic outcomes
-        # This simplifies the tree while we debug
-        new_state = self.game_manager.apply_action(parent.state, action)
-        return MinNode(new_state, parent)
-
-    def _create_child_from_min_action(self, parent: MinNode, action: Action) -> TreeNode:
-        """Create child node after MIN player takes action"""
-        # Same - skip chance nodes for now
-        new_state = self.game_manager.apply_action(parent.state, action)
-        return MaxNode(new_state, parent)
-
-    def _create_child_from_chance_outcome(self, parent: ChanceNode, outcome: str) -> TreeNode:
-        """Create child node after chance outcome is determined"""
-        # Apply the original action with the specific outcome
-        new_state = self.game_manager.apply_action_with_outcome(
-            parent.state, parent.action, outcome
-        )
-
-        # Determine whose turn it is after the chance event
-        if parent.parent and parent.parent.player == PlayerType.MAX:
-            return MinNode(new_state, parent)
+            
+    def update_pokemon(self, species: str, pokemon: Pokemon):
+        """Update known info about a Pokemon"""
+        if species not in self.known_pokemon:
+            self.add_pokemon(species, pokemon)
         else:
-            return MaxNode(new_state, parent)
-
-    def _action_has_randomness(self, action: Action) -> bool:
-        """Check if action involves random elements"""
-        # Temporarily disable randomness to simplify tree
-        return False
-
-    def _simulation(self, node: TreeNode) -> float:
-        """Phase 3: Simulate game to completion using heuristics"""
-        current_state = node.state
-        current_player = node.player
-        depth = 0
-
-        # Quick terminal check
-        if self.game_manager.is_terminal(current_state):
-            return self.game_manager.evaluate_state(current_state)
-
-        # Limited depth simulation to avoid infinite games
-        simulation_depth_limit = 8
-
-        while depth < simulation_depth_limit and not self.game_manager.is_terminal(current_state):
-            # Use heuristic action selection for fast simulation
-            if current_player == PlayerType.MAX:
-                action = self._heuristic_action_selection(current_state, is_max_player=True)
-                current_player = PlayerType.MIN
-            elif current_player == PlayerType.MIN:
-                action = self._heuristic_action_selection(current_state, is_max_player=False)
-                current_player = PlayerType.MAX
-            elif current_player == PlayerType.CHANCE:
-                # Handle chance events
-                outcomes = self._get_chance_outcomes(current_state)
-                outcome = random.choices(
-                    [o[0] for o in outcomes],
-                    weights=[o[1] for o in outcomes]
-                )[0]
-                # Apply outcome and continue
-                current_state = self.game_manager.apply_chance_outcome(current_state, outcome)
-                continue
-
-            # Apply action
-            current_state = self.game_manager.apply_action(current_state, action)
-            depth += 1
-
-        # Return evaluation of final state
-        return self.game_manager.evaluate_state(current_state)
-
-    def _heuristic_action_selection(self, state: GameState, is_max_player: bool) -> Action:
-        """Fast heuristic action selection for simulation phase"""
-        # Generate possible actions
-        if is_max_player:
-            temp_node = MaxNode(state)
+            opp_mon = self.known_pokemon[species]
+            opp_mon.current_hp_fraction = pokemon.current_hp_fraction
+            opp_mon.is_alive = not pokemon.fainted
+            opp_mon.status = pokemon.status.name if pokemon.status else None
+            if pokemon.types:
+                opp_mon.types = [str(t) for t in pokemon.types]
+                
+    def log_move_used(self, species: str, move_id: str):
+        """Record that we saw this Pokemon use this move"""
+        if species in self.known_pokemon:
+            self.known_pokemon[species].add_move(move_id)
+            
+    def get_alive_count(self) -> int:
+        """Get number of opponent Pokemon still alive"""
+        return sum(1 for mon in self.known_pokemon.values() if mon.is_alive)
+        
+    def predict_switch_likelihood(self, current_matchup_score: float) -> float:
+        """Predict how likely opponent is to switch based on matchup"""
+        if current_matchup_score < -2.0:  # Very bad matchup for them
+            return 0.7  # Likely to switch
+        elif current_matchup_score < -1.0:  # Bad matchup
+            return 0.4  # Somewhat likely
+        elif current_matchup_score > 1.5:  # Good matchup for them
+            return 0.1  # Very unlikely to switch
         else:
-            temp_node = MinNode(state)
-
-        actions = temp_node.get_legal_actions()
-        if not actions:
-            return Action(ActionType.MOVE, "Default_Move")  # Fallback
-
-        # Simple heuristic: prefer attacking moves, then switches
-        move_actions = [a for a in actions if a.type == ActionType.MOVE]
-        if move_actions:
-            return random.choice(move_actions)
-
-        return random.choice(actions)
-
-    def _get_chance_outcomes(self, state: GameState) -> List[Tuple[str, float]]:
-        """Get possible chance outcomes with probabilities"""
-        return [("Hit", 0.85), ("Miss", 0.15)]  # Default for moves
-
-    def _backpropagation(self, node: TreeNode, value: float):
-        """Phase 4: Update statistics up the tree"""
-        current = node
-
-        while current is not None:
-            current.visits += 1
-
-            # Update value based on player type
-            if current.player == PlayerType.MAX:
-                current.total_value += value
-            elif current.player == PlayerType.MIN:
-                current.total_value += (1.0 - value)  # MIN wants to minimize MAX's value
-            elif current.player == PlayerType.CHANCE:
-                current.total_value += value  # Chance nodes are neutral
-
-            current = current.parent
-
-    def _has_confident_choice(self, root: MaxNode) -> bool:
-        """Check if we have a confident choice (optional early termination)"""
-        if len(root.children) < 2:
-            return False
-
-        # Sort children by visit count
-        children_by_visits = sorted(
-            root.children.values(),
-            key=lambda c: c.visits,
-            reverse=True
-        )
-
-        if len(children_by_visits) < 2:
-            return False
-
-        best = children_by_visits[0]
-        second_best = children_by_visits[1]
-
-        # Confident if best has many visits and clear value advantage
-        return (best.visits > self.min_visits_for_confidence and
-                best.average_value > second_best.average_value + 0.1)
-
-    def _select_final_action(self, root: MaxNode) -> Action:
-        """Select the final action based on tree statistics"""
-        if not root.children:
-            # Fallback to random action
-            actions = root.get_legal_actions()
-            return random.choice(actions) if actions else Action(ActionType.MOVE, "Default")
-
-        # Strategy: Choose most visited child (most robust)
-        best_child = max(root.children.values(), key=lambda c: c.visits)
-
-        # Find the action that led to this child
-        for action_key, child in root.children.items():
-            if child == best_child:
-                # Parse action from key - this is simplified
-                return self._parse_action_from_key(action_key)
-
-        # Fallback
-        return Action(ActionType.MOVE, "Fallback")
-
-    def _parse_action_from_key(self, action_key: str) -> Action:
-        """Parse action from string key"""
-        # This is a simplified parser - you'd want more robust parsing
-        if "DMAX_" in action_key:
-            parts = action_key.replace("DMAX_", "").split("_")
-            return Action(ActionType.MOVE, "_".join(parts[1:]), is_tera=True)
-        elif "MOVE_" in action_key:
-            return Action(ActionType.MOVE, action_key.replace("MOVE_", ""))
-        elif "SWITCH_" in action_key:
-            return Action(ActionType.SWITCH, action_key.replace("SWITCH_", ""))
-        else:
-            return Action(ActionType.MOVE, "Default")
+            return 0.2  # Default low chance
 
 
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
-
+        
+        # Battle state tracking
+        self.opponent_tracker = OpponentTracker()
+        self._last_switched_turn = -2
+        self._tera_used = False
+        self.gen_data = GenData.from_gen(9)  # Gen 9 type chart and data
+        
+        # Constants for decision making
         self.ENTRY_HAZARDS = {
             "spikes": SideCondition.SPIKES,
-            "stealhrock": SideCondition.STEALTH_ROCK,
+            "stealthrock": SideCondition.STEALTH_ROCK,
             "stickyweb": SideCondition.STICKY_WEB,
             "toxicspikes": SideCondition.TOXIC_SPIKES,
         }
-
         self.ANTI_HAZARDS_MOVES = {"rapidspin", "defog"}
-
         self.SPEED_TIER_COEFICIENT = 0.1
         self.HP_FRACTION_COEFICIENT = 0.4
-        self.SWITCH_OUT_MATCHUP_THRESHOLD = -2
+        self.SWITCH_OUT_MATCHUP_THRESHOLD = -2.0
 
-        # MCTS components
-        self.game_manager = GameStateManager()
-        self.mcts = MCTSAlgorithm(self.game_manager)
-        self.mcts.max_simulations = 500  # Reduce for faster testing
+    def _get_type_effectiveness(self, move_type: str, defending_types: List[str]) -> float:
+        """Calculate type effectiveness using GenData type chart"""
+        if not move_type or not defending_types:
+            return 1.0
+            
+        effectiveness = 1.0
+        try:
+            for def_type in defending_types:
+                if def_type and move_type in self.gen_data.type_chart:
+                    effectiveness *= self.gen_data.type_chart[move_type].damage_multiplier(def_type)
+        except (KeyError, AttributeError):
+            # Fallback to basic calculation if GenData fails
+            effectiveness = 1.0
+            
+        return effectiveness
+    
+    def _calculate_move_damage_estimate(self, move, attacker: Pokemon, defender: Pokemon) -> float:
+        """Estimate move damage using proper type effectiveness"""
+        if not move.base_power:
+            return 0.0
+            
+        # Get STAB
+        stab = 1.5 if move.type and move.type in attacker.types else 1.0
+        
+        # Get type effectiveness
+        defender_types = [str(t) for t in defender.types] if defender.types else []
+        effectiveness = self._get_type_effectiveness(str(move.type), defender_types)
+        
+        # Basic damage estimate (simplified)
+        base_damage = move.base_power * stab * effectiveness * move.accuracy
+        
+        return base_damage
 
-        self._last_switched_turn = -2
+    def _update_opponent_knowledge(self, battle: AbstractBattle):
+        """Update our knowledge of opponent team"""
+        # Update active Pokemon
+        if battle.opponent_active_pokemon:
+            active = battle.opponent_active_pokemon
+            self.opponent_tracker.update_pokemon(active.species, active)
+            
+        # Update team knowledge from battle.opponent_team
+        for mon_id, pokemon in battle.opponent_team.items():
+            if pokemon:
+                self.opponent_tracker.update_pokemon(pokemon.species, pokemon)
 
-    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
-        score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
-        score -= max(
-            [mon.damage_multiplier(t) for t in opponent.types if t is not None]
-        )
+    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon) -> float:
+        """Calculate matchup score between two Pokemon using proper type effectiveness"""
+        if not mon or not opponent:
+            return 0.0
+            
+        score = 0.0
+        
+        # Offensive advantage - how well our types hit opponent
+        if mon.types and opponent.types:
+            our_types = [str(t) for t in mon.types]
+            opp_types = [str(t) for t in opponent.types]
+            
+            # Best type effectiveness we can deal
+            best_offensive = max([
+                self._get_type_effectiveness(our_type, opp_types)
+                for our_type in our_types
+            ])
+            score += best_offensive
+            
+            # Best type effectiveness they can deal to us
+            best_defensive = max([
+                self._get_type_effectiveness(opp_type, our_types)
+                for opp_type in opp_types
+            ])
+            score -= best_defensive
+        
+        # Speed advantage
         if mon.base_stats["spe"] > opponent.base_stats["spe"]:
             score += self.SPEED_TIER_COEFICIENT
         elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
             score -= self.SPEED_TIER_COEFICIENT
 
+        # HP advantage
         score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
 
         return score
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Much more conservative Tera usage"""
+        """Decide whether to use Tera this turn"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
-        if not battle.can_tera or not active or not opponent:
+        if not battle.can_tera or not active or not opponent or self._tera_used:
             return False
 
         current_matchup = self._estimate_matchup(active, opponent)
 
-        # DON'T tera if you're already winning the matchup clearly
+        # Don't tera if already winning clearly
         if current_matchup > 1.5:
             return False
 
-        # Only tera in emergencies or for guaranteed KOs
-        # 1. Emergency: Taking super-effective damage and low HP
+        # Emergency defensive Tera
         if (active.current_hp_fraction < 0.4 and
+                opponent.types and
                 max([active.damage_multiplier(t) for t in opponent.types if t]) > 1.0):
             return True
 
-        # 2. Guaranteed KO opportunity
+        # Offensive Tera for guaranteed KO
         if (opponent.current_hp_fraction < 0.3 and
-                current_matchup < 0 and  # Currently losing matchup
-                active.current_hp_fraction > 0.6):  # We're healthy
+                current_matchup < 0 and
+                active.current_hp_fraction > 0.6):
             return True
 
-        # 3. Setup behind substitute/when completely safe
+        # Setup Tera when safe
         if (active.current_hp_fraction > 0.9 and
                 opponent.current_hp_fraction < 0.5 and
                 any(move.boosts and sum(move.boosts.values()) >= 2
-                    for move in battle.available_moves)):
+                    for move in battle.available_moves if move.boosts)):
             return True
 
         return False
 
-
-    def _should_switch_out(self, battle: AbstractBattle):
-        """Enhanced switch logic with anti-spam protection"""
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        # NEVER switch if you just switched in (anti-switching spam)
-        if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 1:
-            return False
-
-        # If there is a decent switch in...
-        if [m for m in battle.available_switches if self._estimate_matchup(m, opponent) > 0]:
-            # ...and a 'good' reason to switch out
-            if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
-                self._last_switched_turn = battle.turn
-                return True
-            if (active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]):
-                self._last_switched_turn = battle.turn
-                return True
-            if (active.boosts["spa"] <= -3 and active.stats["atk"] <= active.stats["spa"]):
-                self._last_switched_turn = battle.turn
-                return True
-            if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
-                self._last_switched_turn = battle.turn
-                return True
-        return False
-
-    def _stat_estimation(self, mon: Pokemon, stat: str):
-        # Stats boosts value
-        if mon.boosts[stat] > 1:
-            boost = (2 + mon.boosts[stat]) / 2
-        else:
-            boost = 2 / (2 - mon.boosts[stat])
-        return ((2 * mon.base_stats[stat] + 31) + 5) * boost
-
-    def _battle_to_gamestate(self, battle: AbstractBattle) -> GameState:
-        """Convert real battle to abstract GameState"""
-        # Get team HP ratios
-        my_team_hp = []
-        for i in range(6):  # Assuming 6 pokemon teams
-            if i < len(battle.team):
-                pokemon_id = list(battle.team.keys())[i]
-                pokemon = battle.team[pokemon_id]
-                my_team_hp.append(pokemon.current_hp_fraction)
-            else:
-                my_team_hp.append(0.0)
-
-        opp_team_hp = []
-        for i in range(6):
-            if i < len(battle.opponent_team):
-                pokemon_id = list(battle.opponent_team.keys())[i]
-                pokemon = battle.opponent_team[pokemon_id]
-                opp_team_hp.append(pokemon.current_hp_fraction if pokemon else 0.5)  # Unknown = 50%
-            else:
-                opp_team_hp.append(0.0)
-
-        return GameState(
-            my_active=battle.active_pokemon.species if battle.active_pokemon else "unknown",
-            opp_active=battle.opponent_active_pokemon.species if battle.opponent_active_pokemon else "unknown",
-            my_team_hp=my_team_hp,
-            opp_team_hp=opp_team_hp,
-            turn_number=battle.turn,
-            field_conditions={}  # Can be enhanced later
-        )
-
-    def _action_to_battle_order(self, action: Action, battle: AbstractBattle) -> BattleOrder:
-        """Convert abstract Action to real BattleOrder"""
-        if action.type == ActionType.MOVE:
-            # Map to actual available moves
-            move_mapping = {
-                "Move_A": 0, "Move_B": 1, "Move_C": 2, "Move_D": 3
-            }
-
-            if action.target in move_mapping and move_mapping[action.target] < len(battle.available_moves):
-                move = battle.available_moves[move_mapping[action.target]]
-                # Check if we should tera
-                should_tera = action.is_tera and self._should_terastallize(battle)
-                return self.create_order(move, terastallize=should_tera)
-            elif battle.available_moves:
-                # Fallback to best move using your heuristic
-                active = battle.active_pokemon
-                opponent = battle.opponent_active_pokemon
-                physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
-                special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
-
-                best_move = max(
-                    battle.available_moves,
-                    key=lambda m: m.base_power * (1.5 if m.type in active.types else 1) *
-                                  (physical_ratio if m.category == MoveCategory.PHYSICAL else special_ratio) *
-                                  m.accuracy * m.expected_hits * opponent.damage_multiplier(m),
-                )
-                return self.create_order(best_move)
-
-        elif action.type == ActionType.SWITCH:
-            if battle.available_switches:
-                try:
-                    switch_index = int(action.target.split('_')[1]) if '_' in action.target else 0
-                    if switch_index < len(battle.available_switches):
-                        return self.create_order(battle.available_switches[switch_index])
-                except (ValueError, IndexError):
-                    pass
-
-                # Fallback to best switch
-                opponent = battle.opponent_active_pokemon
-                best_switch = max(
-                    battle.available_switches,
-                    key=lambda s: self._estimate_matchup(s, opponent),
-                )
-                return self.create_order(best_switch)
-
-        # Ultimate fallback
-        return self._heuristic_choose_move(battle)
-
-    def _should_use_mcts(self, battle: AbstractBattle) -> bool:
-        """Disable MCTS in mirror matches - use proven heuristic"""
-        # Check if it's a mirror match
-        my_species = {p.species for p in battle.team.values()}
-        opp_species = {p.species for p in battle.opponent_team.values() if p}
-
-        if len(my_species.intersection(opp_species)) >= 4:
-            return False  # Never use MCTS in mirrors
-
-        """Only use MCTS in very specific endgame scenarios"""
+    def _should_switch_out(self, battle: AbstractBattle) -> bool:
+        """Decide whether to switch out current Pokemon"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
         if not active or not opponent:
             return False
 
-        # Only use MCTS in endgame (2 or fewer Pokemon left)
-        n_remaining = sum(1 for p in battle.team.values() if not p.fainted)
+        # Never switch if just switched (prevent switching loops)
+        if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 1:
+            return False
 
-        if n_remaining <= 2:
+        # Check if we have a good switch option
+        good_switches = [
+            mon for mon in battle.available_switches 
+            if self._estimate_matchup(mon, opponent) > 0
+        ]
+        
+        if not good_switches:
+            return False
+
+        # Switch if severely debuffed
+        if (active.boosts["def"] <= -3 or active.boosts["spd"] <= -3 or
+            (active.boosts["atk"] <= -3 and active.stats["atk"] >= active.stats["spa"]) or
+            (active.boosts["spa"] <= -3 and active.stats["atk"] <= active.stats["spa"])):
             return True
 
-        # Or when we're in a really close endgame position
-        close_endgame = (n_remaining == 3 and
-                         active.current_hp_fraction < 0.3 and
-                         opponent.current_hp_fraction < 0.3)
+        # Switch if matchup is terrible
+        if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
+            return True
 
-        return close_endgame
+        return False
 
-    def choose_move(self, battle: AbstractBattle):
+    def _get_move_priority(self, move, battle: AbstractBattle) -> float:
+        """Calculate priority score for a move using proper damage estimation"""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        
+        if not active or not opponent:
+            return 0.0
+
+        score = 0.0
+        
+        # Use proper damage calculation
+        if move.base_power:
+            score += self._calculate_move_damage_estimate(move, active, opponent)
+            
+        # Prioritize KO moves when opponent is low
+        if (opponent.current_hp_fraction < 0.35 and 
+            move.base_power and move.base_power > 80):
+            score *= 2.0
+            
+        # Setup move bonus when safe
+        if (move.boosts and move.target == "self" and 
+            active.current_hp_fraction > 0.8 and
+            self._estimate_matchup(active, opponent) > 0):
+            score += 100
+            
+        # Hazard moves get priority when appropriate
+        if (move.id in self.ENTRY_HAZARDS and 
+            self.opponent_tracker.get_alive_count() >= 4):
+            score += 75
+            
+        # Status move penalties unless specific cases
+        if move.base_power == 0 and not move.boosts and move.id not in self.ENTRY_HAZARDS:
+            score -= 50
+            
+        return score
+
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
+        """Main decision making method"""
         if isinstance(battle, DoubleBattle):
             return self.choose_random_doubles_move(battle)
 
-        # Safety check
-        if not battle.active_pokemon or not battle.opponent_active_pokemon:
-            return self.choose_random_move(battle)
-
-        # Decide whether to use MCTS or heuristic
-        if self._should_use_mcts(battle):
-            try:
-                # print("Using MCTS for decision...")
-                # Convert battle to abstract state
-                game_state = self._battle_to_gamestate(battle)
-
-                # Run MCTS
-                best_action = self.mcts.search(game_state)
-
-                # Convert back to battle order
-                battle_order = self._action_to_battle_order(best_action, battle)
-                # print(f"MCTS chose: {best_action}")
-                return battle_order
-
-            except Exception as e:
-                print(f"MCTS failed: {e}, falling back to heuristic")
-                # Fall through to heuristic
-
-        # Use your original heuristic as fallback
-        # print("Using heuristic decision...")
-        return self._heuristic_choose_move(battle)
-
-
-    def _heuristic_choose_move(self, battle: AbstractBattle):
-        """Enhanced heuristic with priorities, better Tera, and anti-switching logic"""
+        # Update opponent knowledge
+        self._update_opponent_knowledge(battle)
+        
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
-        # Check if we should tera (do this once at the start)
-        should_tera = self._should_terastallize(battle)
+        if not active or not opponent:
+            return self.choose_random_move(battle)
 
-        # PRIORITY 1: If opponent is low HP, go for immediate KO
+        # Decide on Tera usage
+        should_tera = self._should_terastallize(battle)
+        if should_tera:
+            self._tera_used = True
+
+        n_remaining = sum(1 for p in battle.team.values() if not p.fainted)
+        n_opp_remaining = self.opponent_tracker.get_alive_count() or 6
+
+        # PRIORITY 1: KO moves when opponent is low HP
         if opponent.current_hp_fraction < 0.35 and battle.available_moves:
             best_attack = max(
                 battle.available_moves,
-                key=lambda m: m.base_power * opponent.damage_multiplier(m) * m.accuracy * m.expected_hits
+                key=lambda m: self._calculate_move_damage_estimate(m, active, opponent)
             )
             return self.create_order(best_attack, terastallize=should_tera)
 
-        # Calculate damage ratios for later use
-        physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(
-            opponent, "def"
-        )
-        special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(
-            opponent, "spd"
-        )
-
-        if battle.available_moves and (
-                not self._should_switch_out(battle) or not battle.available_switches
-        ):
-            n_remaining_mons = len(
-                [m for m in battle.team.values() if m.fainted is False]
+        # PRIORITY 2: Check if we should switch
+        if self._should_switch_out(battle) and battle.available_switches:
+            self._last_switched_turn = battle.turn
+            best_switch = max(
+                battle.available_switches,
+                key=lambda s: self._estimate_matchup(s, opponent)
             )
-            n_opp_remaining_mons = 6 - len(
-                [m for m in battle.opponent_team.values() if m.fainted is True]
-            )
+            return self.create_order(best_switch)
 
-            # PRIORITY 2: Early Spikes setup (enhanced conditions)
-            if (n_opp_remaining_mons >= 4 and
-                    active.species == "deoxys-speed" and
-                    active.current_hp_fraction > 0.5):
-                for move in battle.available_moves:
-                    if (move.id == "spikes" and
-                            SideCondition.SPIKES not in battle.opponent_side_conditions):
-                        return self.create_order(move, terastallize=should_tera)
-
-            # PRIORITY 3: Entry hazard setup/removal (existing logic)
+        # PRIORITY 3: Hazard setup when beneficial
+        if n_opp_remaining >= 4 and battle.available_moves:
             for move in battle.available_moves:
-                # Hazard setup
-                if (
-                        n_opp_remaining_mons >= 3
-                        and move.id in self.ENTRY_HAZARDS
-                        and self.ENTRY_HAZARDS[move.id]
-                        not in battle.opponent_side_conditions
-                ):
+                if (move.id in self.ENTRY_HAZARDS and 
+                    self.ENTRY_HAZARDS[move.id] not in battle.opponent_side_conditions):
                     return self.create_order(move, terastallize=should_tera)
 
-                # Hazard removal
-                elif (
-                        battle.side_conditions
-                        and move.id in self.ANTI_HAZARDS_MOVES
-                        and n_remaining_mons >= 2
-                ):
+        # PRIORITY 4: Hazard removal when needed
+        if battle.side_conditions and n_remaining >= 2:
+            for move in battle.available_moves:
+                if move.id in self.ANTI_HAZARDS_MOVES:
                     return self.create_order(move, terastallize=should_tera)
 
-            # PRIORITY 4: Setup moves (enhanced conditions)
-            if (
-                    active.current_hp_fraction >= 0.8  # Safer HP threshold
-                    and self._estimate_matchup(active, opponent) > 0.5  # Better matchup required
-            ):
-                for move in battle.available_moves:
-                    if (
-                            move.boosts
-                            and sum(move.boosts.values()) >= 2
-                            and move.target == "self"
-                            and min(
-                        [active.boosts[s] for s, v in move.boosts.items() if v > 0]
+        # PRIORITY 5: Setup moves when safe
+        if (active.current_hp_fraction >= 0.8 and 
+            self._estimate_matchup(active, opponent) > 0.5):
+            for move in battle.available_moves:
+                if (move.boosts and move.target == "self" and
+                    sum(move.boosts.values()) >= 2):
+                    # Check if we can still boost this stat
+                    can_boost = any(
+                        active.boosts.get(stat, 0) < 6 
+                        for stat, boost in move.boosts.items() 
+                        if boost > 0
                     )
-                            < 6
-                    ):
+                    if can_boost:
                         return self.create_order(move, terastallize=should_tera)
 
-            # PRIORITY 5: Best attacking move
-            move = max(
-                battle.available_moves,
-                key=lambda m: m.base_power
-                              * (1.5 if m.type in active.types else 1)
-                              * (
-                                  physical_ratio
-                                  if m.category == MoveCategory.PHYSICAL
-                                  else special_ratio
-                              )
-                              * m.accuracy
-                              * m.expected_hits
-                              * opponent.damage_multiplier(m),
-            )
-            return self.create_order(
-                move,
-                terastallize=should_tera
-            )
+        # PRIORITY 6: Best attacking move
+        if battle.available_moves:
+            best_move = max(battle.available_moves, key=lambda m: self._get_move_priority(m, battle))
+            return self.create_order(best_move, terastallize=should_tera)
 
-        # PRIORITY 6: Switch only if really necessary (with anti-spam protection)
-        if battle.available_switches:
-            switches: List[Pokemon] = battle.available_switches
-            return self.create_order(
-                max(
-                    switches,
-                    key=lambda s: self._estimate_matchup(s, opponent),
-                ),
-                terastallize=should_tera
-            )
-
+        # Fallback
         return self.choose_random_move(battle)
