@@ -1,7 +1,6 @@
 import random
 import time
 import math
-from dataclasses import dataclass
 from typing import List, Optional, Dict, Set
 from dataclasses import dataclass, field
 
@@ -202,6 +201,10 @@ class CustomAgent(Player):
         defender_types = [str(t) for t in defender.types] if defender.types else []
         effectiveness = self._get_type_effectiveness(str(move.type), defender_types)
         
+        # CRITICAL: Don't use moves that do 0 damage!
+        if effectiveness == 0:
+            return -1000  # Heavily penalize 0x damage moves
+        
         # Basic damage estimate (simplified)
         base_damage = move.base_power * stab * effectiveness * move.accuracy
         
@@ -258,7 +261,7 @@ class CustomAgent(Player):
         return score
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Decide whether to use Tera this turn"""
+        """Decide whether to use Tera this turn - more aggressive"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
@@ -266,34 +269,40 @@ class CustomAgent(Player):
             return False
 
         current_matchup = self._estimate_matchup(active, opponent)
+        n_remaining = sum(1 for p in battle.team.values() if not p.fainted)
 
-        # Don't tera if already winning clearly
-        if current_matchup > 1.5:
-            return False
-
-        # Emergency defensive Tera
-        if (active.current_hp_fraction < 0.4 and
+        # Emergency defensive Tera - more lenient HP threshold
+        if (active.current_hp_fraction < 0.6 and
                 opponent.types and
-                max([active.damage_multiplier(t) for t in opponent.types if t]) > 1.0):
+                max([active.damage_multiplier(t) for t in opponent.types if t]) >= 1.0):
             return True
 
-        # Offensive Tera for guaranteed KO
-        if (opponent.current_hp_fraction < 0.3 and
-                current_matchup < 0 and
-                active.current_hp_fraction > 0.6):
+        # Offensive Tera for potential KO - more aggressive
+        if (opponent.current_hp_fraction < 0.5 and
+                current_matchup <= 0.5 and
+                active.current_hp_fraction > 0.4):
             return True
 
-        # Setup Tera when safe
-        if (active.current_hp_fraction > 0.9 and
-                opponent.current_hp_fraction < 0.5 and
+        # Setup Tera when safe - earlier in game
+        if (active.current_hp_fraction > 0.8 and
                 any(move.boosts and sum(move.boosts.values()) >= 2
                     for move in battle.available_moves if move.boosts)):
             return True
+            
+        # Endgame Tera - use it if only 2 Pokemon left
+        if n_remaining <= 2 and active.current_hp_fraction > 0.3:
+            return True
+
+        # Specific Pokemon Tera strategies
+        if active.species == "koraidon" and opponent.species in ["arceus-fairy", "zacian-crowned"]:
+            return True  # Fire Tera vs Steel/Fairy
+        if active.species == "eternatus" and opponent.species == "kingambit":
+            return True  # Fire Tera to resist Dark moves
 
         return False
 
     def _should_switch_out(self, battle: AbstractBattle) -> bool:
-        """Decide whether to switch out current Pokemon"""
+        """Decide whether to switch out current Pokemon - improved logic"""
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
 
@@ -304,13 +313,21 @@ class CustomAgent(Player):
         if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 1:
             return False
 
+        current_matchup = self._estimate_matchup(active, opponent)
+        
         # Check if we have a good switch option
         good_switches = [
-            mon for mon in battle.available_switches 
-            if self._estimate_matchup(mon, opponent) > 0
+            (mon, self._estimate_matchup(mon, opponent)) 
+            for mon in battle.available_switches
         ]
         
         if not good_switches:
+            return False
+            
+        best_switch_matchup = max(good_switches, key=lambda x: x[1])[1]
+        
+        # Don't switch if we don't have a significantly better option
+        if best_switch_matchup <= current_matchup + 0.5:
             return False
 
         # Switch if severely debuffed
@@ -319,8 +336,24 @@ class CustomAgent(Player):
             (active.boosts["spa"] <= -3 and active.stats["atk"] <= active.stats["spa"])):
             return True
 
-        # Switch if matchup is terrible
-        if self._estimate_matchup(active, opponent) < self.SWITCH_OUT_MATCHUP_THRESHOLD:
+        # Switch if matchup is terrible and we have much better option
+        if (current_matchup < self.SWITCH_OUT_MATCHUP_THRESHOLD and 
+            best_switch_matchup > current_matchup + 1.0):
+            return True
+            
+        # Switch if we're about to get KO'd and have a better option
+        if (active.current_hp_fraction < 0.3 and
+            current_matchup < 0 and
+            best_switch_matchup > 0.5):
+            return True
+            
+        # Specific bad matchup switches
+        if (active.species == "eternatus" and opponent.species == "zacian-crowned" and
+            any(mon.species in ["koraidon", "kingambit"] for mon in battle.available_switches)):
+            return True
+            
+        if (active.species == "koraidon" and opponent.species == "arceus-fairy" and
+            any(mon.species == "kingambit" for mon in battle.available_switches)):
             return True
 
         return False
@@ -335,10 +368,20 @@ class CustomAgent(Player):
 
         score = 0.0
         
-        # Use proper damage calculation
+        # Use proper damage calculation for attacking moves
         if move.base_power:
-            score += self._calculate_move_damage_estimate(move, active, opponent)
+            damage_score = self._calculate_move_damage_estimate(move, active, opponent)
+            if damage_score == -1000:  # 0x damage move
+                return -1000  # Never use these moves
+            score += damage_score
             
+        # Don't use status moves that won't work
+        if move.id == "thunderwave" and opponent.status:
+            return -500  # Already statused
+        if move.id in self.ENTRY_HAZARDS:
+            if self.ENTRY_HAZARDS[move.id] in battle.opponent_side_conditions:
+                return -500  # Hazards already up
+                
         # Prioritize KO moves when opponent is low
         if (opponent.current_hp_fraction < 0.35 and 
             move.base_power and move.base_power > 80):
@@ -348,18 +391,72 @@ class CustomAgent(Player):
         if (move.boosts and move.target == "self" and 
             active.current_hp_fraction > 0.8 and
             self._estimate_matchup(active, opponent) > 0):
-            score += 100
+            # Check if we can still boost this stat
+            can_boost = any(
+                active.boosts.get(stat, 0) < 6 
+                for stat, boost in move.boosts.items() 
+                if boost > 0
+            )
+            if can_boost:
+                score += 100
+            else:
+                score -= 200  # Can't boost anymore
             
         # Hazard moves get priority when appropriate
         if (move.id in self.ENTRY_HAZARDS and 
-            self.opponent_tracker.get_alive_count() >= 4):
+            self.opponent_tracker.get_alive_count() >= 4 and
+            self.ENTRY_HAZARDS[move.id] not in battle.opponent_side_conditions):
             score += 75
             
         # Status move penalties unless specific cases
-        if move.base_power == 0 and not move.boosts and move.id not in self.ENTRY_HAZARDS:
+        if (move.base_power == 0 and not move.boosts and 
+            move.id not in self.ENTRY_HAZARDS and move.id != "thunderwave"):
             score -= 50
             
         return score
+
+    def _predict_opponent_action(self, battle: AbstractBattle) -> str:
+        """Simple prediction based on matchup and game state"""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        
+        if not active or not opponent:
+            return "stay"
+            
+        matchup_from_opp_perspective = self._estimate_matchup(opponent, active)
+        
+        # If opponent is in a very bad matchup, they'll likely switch
+        if matchup_from_opp_perspective < -1.5:
+            return "switch"
+        # If opponent is in a good matchup, they'll likely stay and attack
+        elif matchup_from_opp_perspective > 1.0:
+            return "attack"
+        # If opponent is low HP, they might switch to preserve the Pokemon
+        elif opponent.current_hp_fraction < 0.3:
+            return "switch"
+        else:
+            return "attack"
+    
+    def _adjust_move_for_prediction(self, move, battle: AbstractBattle) -> float:
+        """Adjust move priority based on opponent prediction"""
+        prediction = self._predict_opponent_action(battle)
+        base_score = self._get_move_priority(move, battle)
+        
+        # If we predict they'll switch and our move hits the switch-in hard
+        if prediction == "switch" and move.base_power and move.base_power > 80:
+            # Favor powerful moves that can hit common switch-ins
+            if move.type and str(move.type) in ["fire", "fighting", "steel"]:  # Good coverage
+                base_score *= 1.2
+                
+        # If we predict they'll attack, favor defensive plays or super effective hits
+        elif prediction == "attack":
+            if move.boosts and move.target == "self":  # Setup moves
+                base_score *= 0.8  # Less safe if they're attacking
+            elif move.base_power and self._get_type_effectiveness(str(move.type), 
+                [str(t) for t in battle.opponent_active_pokemon.types]) > 1.0:
+                base_score *= 1.3  # Super effective moves
+                
+        return base_score
 
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Main decision making method"""
@@ -428,9 +525,9 @@ class CustomAgent(Player):
                     if can_boost:
                         return self.create_order(move, terastallize=should_tera)
 
-        # PRIORITY 6: Best attacking move
+        # PRIORITY 6: Best attacking move (with prediction)
         if battle.available_moves:
-            best_move = max(battle.available_moves, key=lambda m: self._get_move_priority(m, battle))
+            best_move = max(battle.available_moves, key=lambda m: self._adjust_move_for_prediction(m, battle))
             return self.create_order(best_move, terastallize=should_tera)
 
         # Fallback
