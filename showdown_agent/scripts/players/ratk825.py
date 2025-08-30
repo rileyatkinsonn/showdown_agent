@@ -1,8 +1,6 @@
 from poke_env.battle import AbstractBattle, Move
 from poke_env.player import Player
 from poke_env.data import GenData
-import numpy as np
-from poke_env.teambuilder import Teambuilder
 
 team = """
 Deoxys-Speed @ Focus Sash  
@@ -82,6 +80,15 @@ def find_all_actions(battle):
         for switch in battle.available_switches:
             actions.append(switch)
 
+def score_move(battle, move):
+    return
+
+def score_move_tera(battle, move):
+    return
+
+def score_switch(battle, switch):
+    return
+
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
@@ -90,6 +97,4 @@ class CustomAgent(Player):
         find_all_actions(battle)
 
 
-
-
-        return self.choose_move(battle)
+        return self.choose_random_move(battle)
