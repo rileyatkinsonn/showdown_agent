@@ -100,7 +100,6 @@ class PlayerType(Enum):
 class ActionType(Enum):
     MOVE = "MOVE"
     SWITCH = "SWITCH"
-    DYNAMAX_MOVE = "DYNAMAX_MOVE"
 
 
 @dataclass
@@ -108,10 +107,10 @@ class Action:
     """Represents a single game action"""
     type: ActionType
     target: str  # move name or pokemon name
-    is_dynamax: bool = False
+    is_tera: bool = False
 
     def __str__(self):
-        prefix = "DMAX_" if self.is_dynamax else ""
+        prefix = "TERA_" if self.is_tera else ""
         return f"{prefix}{self.type.value}_{self.target}"
 
 
@@ -167,11 +166,11 @@ class MaxNode(TreeNode):
     def _generate_actions(self) -> List[Action]:
         """Generate all possible actions from this state"""
         actions = []
-        # Add regular moves only (no dynamax)
+        # Add regular moves
         for move in ["Move_A", "Move_B", "Move_C", "Move_D"]:
             actions.append(Action(ActionType.MOVE, move))
-            # Remove dynamax actions since they're not available
-            # actions.append(Action(ActionType.MOVE, move, is_dynamax=True))
+            # Add tera versions of moves
+            actions.append(Action(ActionType.MOVE, move, is_tera=True))
 
         # Add switches
         for i, hp in enumerate(self.state.my_team_hp):
@@ -229,7 +228,8 @@ class MinNode(TreeNode):
         actions = []
         for move in ["Opp_Move_A", "Opp_Move_B", "Opp_Move_C"]:
             actions.append(Action(ActionType.MOVE, move))
-            # Remove dynamax for opponent too
+            # Add tera versions for opponent too
+            actions.append(Action(ActionType.MOVE, move, is_tera=True))
 
         # Add opponent switches
         for i, hp in enumerate(self.state.opp_team_hp):
@@ -347,7 +347,7 @@ class GameStateManager:
             # Handle switching
             new_state.my_active = action.target
 
-        elif action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+        elif action.type == ActionType.MOVE:
             # Simulate damage
             damage = self.damage_calculator.estimate_damage(action, state)
             opp_active_idx = self._get_active_index(state.opp_active)
@@ -436,7 +436,7 @@ class GameStateManager:
         new_state = self.apply_action(state, action)
 
         # Modify based on outcome
-        if outcome == "Miss" and action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+        if outcome == "Miss" and action.type == ActionType.MOVE:
             # Move missed - no damage dealt, just return state without damage
             return GameState(
                 my_active=new_state.my_active,
@@ -446,7 +446,7 @@ class GameStateManager:
                 turn_number=new_state.turn_number,
                 field_conditions=new_state.field_conditions
             )
-        elif outcome == "Hit" and action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+        elif outcome == "Hit" and action.type == ActionType.MOVE:
             # Move hit - damage was already applied in apply_action
             return new_state
 
@@ -668,7 +668,7 @@ class MCTSAlgorithm:
             return Action(ActionType.MOVE, "Default_Move")  # Fallback
 
         # Simple heuristic: prefer attacking moves, then switches
-        move_actions = [a for a in actions if a.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]]
+        move_actions = [a for a in actions if a.type == ActionType.MOVE]
         if move_actions:
             return random.choice(move_actions)
 
@@ -741,7 +741,7 @@ class MCTSAlgorithm:
         # This is a simplified parser - you'd want more robust parsing
         if "DMAX_" in action_key:
             parts = action_key.replace("DMAX_", "").split("_")
-            return Action(ActionType.DYNAMAX_MOVE, "_".join(parts[1:]), is_dynamax=True)
+            return Action(ActionType.MOVE, "_".join(parts[1:]), is_tera=True)
         elif "MOVE_" in action_key:
             return Action(ActionType.MOVE, action_key.replace("MOVE_", ""))
         elif "SWITCH_" in action_key:
@@ -824,28 +824,6 @@ class CustomAgent(Player):
 
         return False
 
-    def _should_dynamax(self, battle: AbstractBattle, n_remaining_mons: int):
-        if battle.can_dynamax:
-            # Last full HP mon
-            if (
-                    len([m for m in battle.team.values() if m.current_hp_fraction == 1])
-                    == 1
-                    and battle.active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            # Matchup advantage and full hp on full hp
-            if (
-                    self._estimate_matchup(
-                        battle.active_pokemon, battle.opponent_active_pokemon
-                    )
-                    > 0
-                    and battle.active_pokemon.current_hp_fraction == 1
-                    and battle.opponent_active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            if n_remaining_mons == 1:
-                return True
-        return False
 
     def _should_switch_out(self, battle: AbstractBattle):
         """Enhanced switch logic with anti-spam protection"""
@@ -921,8 +899,9 @@ class CustomAgent(Player):
 
             if action.target in move_mapping and move_mapping[action.target] < len(battle.available_moves):
                 move = battle.available_moves[move_mapping[action.target]]
-                # Don't pass dynamax=True since it's not available
-                return self.create_order(move)
+                # Check if we should tera
+                should_tera = action.is_tera and self._should_terastallize(battle)
+                return self.create_order(move, terastallize=should_tera)
             elif battle.available_moves:
                 # Fallback to best move using your heuristic
                 active = battle.active_pokemon
@@ -1018,37 +997,6 @@ class CustomAgent(Player):
         # print("Using heuristic decision...")
         return self._heuristic_choose_move(battle)
 
-    def _should_terastallize(self, battle: AbstractBattle) -> bool:
-        """Aggressive Tera usage for mirrors"""
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        if not battle.can_tera or not active or not opponent:
-            return False
-
-        # Tera early for defensive purposes in bad matchups
-        current_matchup = self._estimate_matchup(active, opponent)
-
-        # 1. Emergency defensive Tera when taking super-effective damage
-        if active.current_hp_fraction < 0.6:
-            damage_taken = max([active.damage_multiplier(t) for t in opponent.types if t])
-            if damage_taken > 1.0:  # Taking super-effective damage
-                return True
-
-        # 2. Offensive Tera when healthy and can KO
-        if (active.current_hp_fraction > 0.7 and
-                opponent.current_hp_fraction < 0.4 and
-                current_matchup > 0):
-            return True
-
-        # 3. Tera when setting up (Calm Mind, Swords Dance)
-        if active.current_hp_fraction == 1.0 and any(
-                move.boosts and sum(move.boosts.values()) >= 2
-                for move in battle.available_moves
-        ):
-            return True
-
-        return False
 
     def _heuristic_choose_move(self, battle: AbstractBattle):
         """Enhanced heuristic with priorities, better Tera, and anti-switching logic"""
@@ -1145,7 +1093,6 @@ class CustomAgent(Player):
             )
             return self.create_order(
                 move,
-                dynamax=self._should_dynamax(battle, n_remaining_mons),
                 terastallize=should_tera
             )
 
