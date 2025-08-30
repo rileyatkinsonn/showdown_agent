@@ -103,7 +103,6 @@ class PlayerType(Enum):
 class ActionType(Enum):
     MOVE = "MOVE"
     SWITCH = "SWITCH"
-    DYNAMAX_MOVE = "DYNAMAX_MOVE"
 
 
 @dataclass
@@ -111,11 +110,9 @@ class Action:
     """Represents a single game action"""
     type: ActionType
     target: str  # move name or pokemon name
-    is_dynamax: bool = False
 
     def __str__(self):
-        prefix = "DMAX_" if self.is_dynamax else ""
-        return f"{prefix}{self.type.value}_{self.target}"
+        return f"{self.type.value}_{self.target}"
 
 
 @dataclass
@@ -170,11 +167,9 @@ class MaxNode(TreeNode):
     def _generate_actions(self) -> List[Action]:
         """Generate all possible actions from this state"""
         actions = []
-        # Add regular moves only (no dynamax)
+        # Add regular moves (Gen 9 - no dynamax)
         for move in ["Move_A", "Move_B", "Move_C", "Move_D"]:
             actions.append(Action(ActionType.MOVE, move))
-            # Remove dynamax actions since they're not available
-            # actions.append(Action(ActionType.MOVE, move, is_dynamax=True))
 
         # Add switches
         for i, hp in enumerate(self.state.my_team_hp):
@@ -232,7 +227,6 @@ class MinNode(TreeNode):
         actions = []
         for move in ["Opp_Move_A", "Opp_Move_B", "Opp_Move_C"]:
             actions.append(Action(ActionType.MOVE, move))
-            # Remove dynamax for opponent too
 
         # Add opponent switches
         for i, hp in enumerate(self.state.opp_team_hp):
@@ -350,7 +344,7 @@ class GameStateManager:
             # Handle switching
             new_state.my_active = action.target
 
-        elif action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+        elif action.type == ActionType.MOVE:
             # Simulate damage
             damage = self.damage_calculator.estimate_damage(action, state)
             opp_active_idx = self._get_active_index(state.opp_active)
@@ -399,12 +393,12 @@ class GameStateManager:
         return my_alive == 0 or opp_alive == 0
 
     def evaluate_state(self, state: GameState) -> float:
-        """Evaluate position with heavy switch penalty"""
+        """Simplified state evaluation focusing on key factors"""
         if self.is_terminal(state):
             my_alive = sum(1 for hp in state.my_team_hp if hp > 0)
             return 1.0 if my_alive > 0 else 0.0
 
-        # Team count advantage
+        # Team count advantage (most important)
         my_count = sum(1 for hp in state.my_team_hp if hp > 0)
         opp_count = sum(1 for hp in state.opp_team_hp if hp > 0)
 
@@ -418,15 +412,14 @@ class GameStateManager:
         opp_hp = sum(state.opp_team_hp)
         hp_score = my_hp / (my_hp + opp_hp) if (my_hp + opp_hp) > 0 else 0.5
 
-        # Heavy penalty for having low HP active Pokemon (discourages switching)
-        active_hp_penalty = 0.0
+        # Small penalty for low HP active Pokemon
+        active_penalty = 0.0
         if len(state.my_team_hp) > 0:
-            # Assume active is first in list for now
             active_hp = state.my_team_hp[0]
-            if active_hp < 0.5:
-                active_hp_penalty = 0.1  # Penalty for low HP active
+            if active_hp < 0.3:
+                active_penalty = 0.05
 
-        return 0.8 * team_score + 0.2 * hp_score - active_hp_penalty
+        return 0.75 * team_score + 0.25 * hp_score - active_penalty
 
     def apply_chance_outcome(self, state: GameState, outcome: str) -> GameState:
         """Apply a chance outcome to state"""
@@ -439,7 +432,7 @@ class GameStateManager:
         new_state = self.apply_action(state, action)
 
         # Modify based on outcome
-        if outcome == "Miss" and action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+        if outcome == "Miss" and action.type == ActionType.MOVE:
             # Move missed - no damage dealt, just return state without damage
             return GameState(
                 my_active=new_state.my_active,
@@ -449,7 +442,7 @@ class GameStateManager:
                 turn_number=new_state.turn_number,
                 field_conditions=new_state.field_conditions
             )
-        elif outcome == "Hit" and action.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]:
+        elif outcome == "Hit" and action.type == ActionType.MOVE:
             # Move hit - damage was already applied in apply_action
             return new_state
 
@@ -526,9 +519,9 @@ class MCTSAlgorithm:
     def __init__(self, game_manager: GameStateManager):
         self.game_manager = game_manager
         self.exploration_constant = 1.4
-        self.max_simulations = 50
-        self.max_depth = 6  # Can go deeper without time pressure
-        self.min_visits_for_confidence = 50  # Ensure robust decisions
+        self.max_simulations = 100  # Conservative increase from 50
+        self.max_depth = 8  # Moderate increase from 6
+        self.min_visits_for_confidence = 25  # Reasonable threshold
 
     def search(self, root_state: GameState) -> Action:
         """Main MCTS search function"""
@@ -578,7 +571,11 @@ class MCTSAlgorithm:
 
         # Select random untried action
         action = random.choice(untried_actions)
-        node.untried_actions.remove(action)
+        if hasattr(node, 'untried_actions'):
+            try:
+                node.untried_actions.remove(action)
+            except (ValueError, AttributeError):
+                pass  # Action already removed or doesn't exist
 
         # Create child node based on action and current player
         if node.player == PlayerType.MAX:
@@ -636,7 +633,7 @@ class MCTSAlgorithm:
             return self.game_manager.evaluate_state(current_state)
 
         # Limited depth simulation to avoid infinite games
-        simulation_depth_limit = 8
+        simulation_depth_limit = 10  # Moderate increase from 8
 
         while depth < simulation_depth_limit and not self.game_manager.is_terminal(current_state):
             # Use heuristic action selection for fast simulation
@@ -677,7 +674,7 @@ class MCTSAlgorithm:
             return Action(ActionType.MOVE, "Default_Move")  # Fallback
 
         # Simple heuristic: prefer attacking moves, then switches
-        move_actions = [a for a in actions if a.type in [ActionType.MOVE, ActionType.DYNAMAX_MOVE]]
+        move_actions = [a for a in actions if a.type == ActionType.MOVE]
         if move_actions:
             return random.choice(move_actions)
 
@@ -746,17 +743,45 @@ class MCTSAlgorithm:
         return Action(ActionType.MOVE, "Fallback")
 
     def _parse_action_from_key(self, action_key: str) -> Action:
-        """Parse action from string key"""
-        # This is a simplified parser - you'd want more robust parsing
-        if "DMAX_" in action_key:
-            parts = action_key.replace("DMAX_", "").split("_")
-            return Action(ActionType.DYNAMAX_MOVE, "_".join(parts[1:]), is_dynamax=True)
-        elif "MOVE_" in action_key:
-            return Action(ActionType.MOVE, action_key.replace("MOVE_", ""))
-        elif "SWITCH_" in action_key:
-            return Action(ActionType.SWITCH, action_key.replace("SWITCH_", ""))
-        else:
+        """Robust action parsing from string key"""
+        if not action_key or not isinstance(action_key, str):
             return Action(ActionType.MOVE, "Default")
+        
+        # Handle dynamax moves (legacy - shouldn't occur in Gen 9)
+        if action_key.startswith("DMAX_"):
+            remaining = action_key[5:]  # Remove "DMAX_" prefix
+            if remaining.startswith("MOVE_"):
+                target = remaining[5:]  # Remove "MOVE_" 
+                return Action(ActionType.MOVE, target)
+            return Action(ActionType.MOVE, remaining)
+        
+        # Handle regular moves
+        if action_key.startswith("MOVE_"):
+            target = action_key[5:]  # Remove "MOVE_" prefix
+            return Action(ActionType.MOVE, target)
+        
+        # Handle switches  
+        if action_key.startswith("SWITCH_"):
+            target = action_key[7:]  # Remove "SWITCH_" prefix
+            return Action(ActionType.SWITCH, target)
+        
+        # Fallback: try to parse the full action string
+        try:
+            # Handle format like "ActionType.MOVE_target"
+            if "_" in action_key:
+                parts = action_key.split("_", 1)
+                action_part = parts[0].upper()
+                target_part = parts[1] if len(parts) > 1 else "Default"
+                
+                if "MOVE" in action_part:
+                    return Action(ActionType.MOVE, target_part)
+                elif "SWITCH" in action_part:
+                    return Action(ActionType.SWITCH, target_part)
+                    
+        except Exception:
+            pass
+            
+        return Action(ActionType.MOVE, "Default")
 
 
 class CustomAgent(Player):
@@ -774,12 +799,12 @@ class CustomAgent(Player):
 
         self.SPEED_TIER_COEFICIENT = 0.1
         self.HP_FRACTION_COEFICIENT = 0.4
-        self.SWITCH_OUT_MATCHUP_THRESHOLD = -2
+        self.SWITCH_OUT_MATCHUP_THRESHOLD = -1.5
 
         # MCTS components
         self.game_manager = GameStateManager()
         self.mcts = MCTSAlgorithm(self.game_manager)
-        self.mcts.max_simulations = 500  # Reduce for faster testing
+        # Simulations already set in MCTSAlgorithm constructor (300)
 
         self._last_switched_turn = -2
 
@@ -797,37 +822,56 @@ class CustomAgent(Player):
         return self._gen_data
 
     def _get_lead_pokemon_species(self, battle: AbstractBattle) -> str:
-        """Determine the best lead Pokemon species based on team composition"""
+        """Smart lead selection based on opponent team strength"""
         gen_data = self._get_gen_data(battle)
-
-        # Prefer fast setup Pokemon with hazard-setting moves
-        priority_leads = []
-
-        for pokemon in battle.team.values():
-            species_data = gen_data.pokedex.get(pokemon.species.replace("-", "").lower())
-            if not species_data:
-                continue
-
-            # Check if Pokemon has hazard-setting moves
-            has_hazard_moves = any(
-                move_id in self.ENTRY_HAZARDS
-                for move_id in pokemon.moves.keys() if pokemon.moves
-            )
-
-            # Prioritize fast Pokemon with setup moves
-            if species_data.get("baseStats", {}).get("spe", 0) >= 150 and has_hazard_moves:
-                priority_leads.append(pokemon.species)
-
-        # Fallback to fastest Pokemon
-        if not priority_leads:
-            fastest_pokemon = max(
-                battle.team.values(),
-                key=lambda p: gen_data.pokedex.get(p.species.replace("-", "").lower(), {})
-                .get("baseStats", {}).get("spe", 0)
-            )
-            return fastest_pokemon.species
-
-        return priority_leads[0]
+        
+        # Analyze opponent team power level
+        known_opp_species = {p.species for p in battle.opponent_team.values() if p}
+        
+        # Uber-tier Pokemon (need careful approach)
+        uber_threats = {
+            "Zacian-Crowned", "Koraidon", "Miraidon", "Eternatus", "Arceus-Fairy", 
+            "Deoxys-Speed", "Kingambit", "Ho-Oh", "Lugia", "Giratina-Origin"
+        }
+        
+        # Check if opponent has strong Uber-tier Pokemon
+        opp_uber_count = len(known_opp_species.intersection(uber_threats))
+        
+        if opp_uber_count >= 3:
+            # Strong Uber team - use careful lead selection
+            lead_priority = [
+                "Deoxys-Speed",    # Speed control vs Ubers
+                "Zacian-Crowned",  # Counter other Ubers  
+                "Arceus-Fairy",    # Defensive pivot
+                "Koraidon",        # Setup sweeper
+                "Eternatus",       # Special attacker
+                "Kingambit"        # Physical attacker
+            ]
+        else:
+            # Weaker non-Uber team - use aggressive leads that can sweep
+            lead_priority = [
+                "Zacian-Crowned",  # Setup and sweep weak teams
+                "Koraidon",        # Alternative setup sweeper
+                "Deoxys-Speed",    # Speed control if needed
+                "Eternatus",       # Special attacker
+                "Arceus-Fairy",    # Defensive option
+                "Kingambit"        # Physical attacker
+            ]
+        
+        # Find first available priority lead
+        available_species = [p.species for p in battle.team.values()]
+        
+        for species in lead_priority:
+            if species in available_species:
+                return species
+        
+        # Ultimate fallback: fastest Pokemon
+        fastest_pokemon = max(
+            battle.team.values(),
+            key=lambda p: gen_data.pokedex.get(p.species.replace("-", "").lower(), {})
+            .get("baseStats", {}).get("spe", 0)
+        )
+        return fastest_pokemon.species
 
     def _get_type_effectiveness(self, attacking_type: str, defending_types: List[str], battle: AbstractBattle) -> float:
         """Calculate type effectiveness using GenData"""
@@ -1033,9 +1077,20 @@ class CustomAgent(Player):
                     if move.id == "taunt":
                         return self.create_order(move)
 
-            # If we're faster (50/50), set Spikes
+            # Priority: Thunder Wave to cripple opponent Deoxys
+            if opponent.status is None:
+                for move in battle.available_moves:
+                    if move.id == "thunderwave":
+                        return self.create_order(move)
+
+            # Then set Spikes if we haven't yet
             for move in battle.available_moves:
                 if move.id == "spikes" and SideCondition.SPIKES not in battle.opponent_side_conditions:
+                    return self.create_order(move)
+                    
+            # Taunt to prevent opponent setup
+            for move in battle.available_moves:
+                if move.id == "taunt":
                     return self.create_order(move)
 
         # Priority 2: Counter-lead strategies
@@ -1165,26 +1220,7 @@ class CustomAgent(Player):
         return False
 
     def _should_dynamax(self, battle: AbstractBattle, n_remaining_mons: int):
-        if battle.can_dynamax:
-            # Last full HP mon
-            if (
-                    len([m for m in battle.team.values() if m.current_hp_fraction == 1])
-                    == 1
-                    and battle.active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            # Matchup advantage and full hp on full hp
-            if (
-                    self._estimate_matchup(
-                        battle.active_pokemon, battle.opponent_active_pokemon
-                    )
-                    > 0
-                    and battle.active_pokemon.current_hp_fraction == 1
-                    and battle.opponent_active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            if n_remaining_mons == 1:
-                return True
+        # Dynamax is illegal in Gen 9 - always return False
         return False
 
     def _should_switch_out(self, battle: AbstractBattle):
@@ -1196,6 +1232,20 @@ class CustomAgent(Player):
         # Anti-switch spam (stricter)
         if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 2:
             return False
+            
+        # Avoid switching when hazards are up unless absolutely necessary
+        hazard_damage = 0
+        if SideCondition.SPIKES in battle.side_conditions:
+            hazard_damage += battle.side_conditions[SideCondition.SPIKES] * 0.125  # 12.5% per layer
+        if SideCondition.STEALTH_ROCK in battle.side_conditions:
+            hazard_damage += 0.125  # Base stealth rock damage
+            
+        # If hazards would deal significant damage, be more reluctant to switch
+        if hazard_damage >= 0.25:  # 25% or more damage from hazards
+            # Only switch in truly desperate situations
+            current_matchup = self._estimate_matchup(active, opp, battle)
+            if current_matchup > -2.5:  # Not completely hopeless
+                return False
 
         # CRITICAL BAD MATCHUPS using GenData
         matchup_data = self._get_critical_matchups(active.species, opp.species, battle)
@@ -1203,7 +1253,9 @@ class CustomAgent(Player):
         if matchup_data["critical_bad"] and battle.available_switches:
             # Find the best counter using type effectiveness
             best_counter = self._find_best_counter(opp.species, battle)
-            if best_counter and best_counter.current_hp_fraction > 0.7:
+            # More strict requirements - don't switch unless we have a clear advantage
+            if (best_counter and best_counter.current_hp_fraction > 0.8 and
+                self._estimate_matchup(best_counter, opp, battle) > 1.0):
                 self._last_switched_turn = battle.turn
                 return best_counter
 
@@ -1351,25 +1403,16 @@ class CustomAgent(Player):
         return self._heuristic_choose_move(battle)
 
     def _should_use_mcts(self, battle: AbstractBattle) -> bool:
-        # Check if it's a mirror match
+        """Conservative MCTS usage - only for critical endgame decisions"""        
+        # Never use in mirror matches - too complex and slow
         if self._is_mirror_match(battle):
-            return False  # Never use MCTS in mirrors
+            return False
 
-        # Only use MCTS in endgame (2 or fewer Pokemon left)
+        # Only use MCTS in true endgames (2 or fewer Pokemon left)
         n_remaining = sum(1 for p in battle.team.values() if not p.fainted)
-
+        
         if n_remaining <= 2:
             return True
-
-        # Or when we're in a really close endgame position
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        if active and opponent:
-            close_endgame = (n_remaining == 3 and
-                             active.current_hp_fraction < 0.3 and
-                             opponent.current_hp_fraction < 0.3)
-            return close_endgame
 
         return False
 
@@ -1381,13 +1424,21 @@ class CustomAgent(Player):
         if not battle.active_pokemon or not battle.opponent_active_pokemon:
             return self.choose_random_move(battle)
 
-        # CRITICAL: Force best lead Pokemon on turn 1
+        # CRITICAL: Force best lead Pokemon on turn 1  
         if battle.turn == 1:
-            ideal_lead = self._get_lead_pokemon_species(battle)
-            if battle.active_pokemon.species != ideal_lead and battle.available_switches:
-                for switch in battle.available_switches:
-                    if switch.species == ideal_lead:
-                        return self.create_order(switch)
+            # In mirror matches, ALWAYS lead with Deoxys-Speed for speed control
+            if self._is_mirror_match(battle):
+                if battle.active_pokemon.species != "Deoxys-Speed" and battle.available_switches:
+                    for switch in battle.available_switches:
+                        if switch.species == "Deoxys-Speed":
+                            return self.create_order(switch)
+            else:
+                # Non-mirror match lead selection
+                ideal_lead = self._get_lead_pokemon_species(battle)
+                if battle.active_pokemon.species != ideal_lead and battle.available_switches:
+                    for switch in battle.available_switches:
+                        if switch.species == ideal_lead:
+                            return self.create_order(switch)
 
         # Check for mirror match first
         if self._is_mirror_match(battle):
@@ -1395,16 +1446,20 @@ class CustomAgent(Player):
             if mirror_order:
                 return mirror_order
 
-        # Enhanced switch logic
+        # Enhanced switch logic - be more conservative
         should_switch = self._should_switch_out(battle)
         if should_switch and should_switch != True:  # If it returns a specific Pokemon
-            return self.create_order(should_switch)
+            # Double-check: only switch if the new Pokemon has a clear advantage
+            if self._estimate_matchup(should_switch, battle.opponent_active_pokemon, battle) > 0.5:
+                return self.create_order(should_switch)
         elif should_switch == True and battle.available_switches:  # If it returns True but no specific Pokemon
             best_switch = max(
                 battle.available_switches,
                 key=lambda s: self._estimate_matchup(s, battle.opponent_active_pokemon, battle)
             )
-            return self.create_order(best_switch)
+            # Only switch if the advantage is significant
+            if self._estimate_matchup(best_switch, battle.opponent_active_pokemon, battle) > 0.8:
+                return self.create_order(best_switch)
 
         # Use MCTS only in specific non-mirror endgames
         if self._should_use_mcts(battle):
@@ -1429,11 +1484,15 @@ class CustomAgent(Player):
             else self._should_terastallize(battle)
         )
 
-        # PRIORITY 1: If opponent is low HP, go for immediate KO (lower threshold in mirrors)
+        # PRIORITY 1: If opponent is low HP, go for guaranteed KO with reliable moves
         ko_threshold = 0.4 if self._is_mirror_match(battle) else 0.35
         if opponent.current_hp_fraction < ko_threshold and battle.available_moves:
+            # Prioritize high-accuracy moves for crucial KOs
+            reliable_moves = [m for m in battle.available_moves if m.accuracy >= 0.9 and m.base_power > 60]
+            moves_to_consider = reliable_moves if reliable_moves else battle.available_moves
+            
             best_attack = max(
-                battle.available_moves,
+                moves_to_consider,
                 key=lambda m: (
                         m.base_power *
                         opponent.damage_multiplier(m) *
@@ -1461,8 +1520,17 @@ class CustomAgent(Player):
             )
 
             # PRIORITY 2: CRITICAL HAZARD MANAGEMENT
-            # Remove hazards if we're taking significant damage
-            if battle.side_conditions and n_remaining_mons >= 2:
+            # Remove hazards if we're taking significant damage and have multiple Pokemon left
+            hazard_layers = 0
+            if SideCondition.SPIKES in battle.side_conditions:
+                hazard_layers += battle.side_conditions[SideCondition.SPIKES]
+            if SideCondition.STEALTH_ROCK in battle.side_conditions:
+                hazard_layers += 1
+            if SideCondition.TOXIC_SPIKES in battle.side_conditions:
+                hazard_layers += battle.side_conditions[SideCondition.TOXIC_SPIKES]
+                
+            # Prioritize hazard removal if we have many layers and Pokemon to save
+            if hazard_layers >= 2 and n_remaining_mons >= 3:
                 for move in battle.available_moves:
                     if move.id in self.ANTI_HAZARDS_MOVES:
                         return self.create_order(move, terastallize=should_tera)
@@ -1480,36 +1548,62 @@ class CustomAgent(Player):
                           SideCondition.STEALTH_ROCK not in battle.opponent_side_conditions):
                         return self.create_order(move, terastallize=should_tera)
 
-            # PRIORITY 3: Setup moves (enhanced conditions)
+            # PRIORITY 3: Setup moves (smarter conditions based on game state)
             setup_hp_threshold = 0.7 if self._is_mirror_match(battle) else 0.8
             setup_matchup_threshold = 0.5 if self._is_mirror_match(battle) else 0.5
 
-            if (active.current_hp_fraction >= setup_hp_threshold and
-                    self._estimate_matchup(active, opponent) > setup_matchup_threshold and
-                    n_remaining_mons >= 3):  # Don't setup in endgame
+            # Consider setup based on remaining Pokemon counts
+            should_setup = False
+            if n_remaining_mons >= 4:  # Early/mid game - safe to setup
+                should_setup = (active.current_hp_fraction >= setup_hp_threshold and
+                              self._estimate_matchup(active, opponent) > setup_matchup_threshold)
+            elif n_remaining_mons == 3:  # Late mid game - be more selective
+                should_setup = (active.current_hp_fraction >= 0.8 and
+                              self._estimate_matchup(active, opponent) > 1.0 and
+                              opponent.current_hp_fraction < 0.6)  # Only setup vs weakened opponent
+            # Don't setup in endgame (n_remaining_mons <= 2) unless already winning
+
+            if should_setup:
                 for move in battle.available_moves:
                     if (move.boosts and sum(move.boosts.values()) >= 2 and
                             move.target == "self" and
                             min([active.boosts[s] for s, v in move.boosts.items() if v > 0]) < 6):
                         return self.create_order(move, terastallize=should_tera)
 
-            # PRIORITY 4: Best attacking move
-            move = max(
-                battle.available_moves,
-                key=lambda m: m.base_power
-                              * (1.5 if m.type in active.types else 1)
-                              * (
-                                  physical_ratio
-                                  if m.category == MoveCategory.PHYSICAL
-                                  else special_ratio
-                              )
-                              * m.accuracy
-                              * m.expected_hits
-                              * opponent.damage_multiplier(m),
-            )
+            # PRIORITY 4: Best attacking move (avoid unreliable moves in close games)
+            # If opponent is at moderate HP, prefer reliable moves over raw power
+            if opponent.current_hp_fraction > 0.6:
+                # Penalize very low accuracy moves when opponent is healthy
+                move = max(
+                    battle.available_moves,
+                    key=lambda m: m.base_power
+                                  * (1.5 if m.type in active.types else 1)
+                                  * (
+                                      physical_ratio
+                                      if m.category == MoveCategory.PHYSICAL
+                                      else special_ratio
+                                  )
+                                  * (m.accuracy ** 2)  # Heavily penalize low accuracy when opponent healthy
+                                  * m.expected_hits
+                                  * opponent.damage_multiplier(m),
+                )
+            else:
+                # Normal move selection when opponent is weakened
+                move = max(
+                    battle.available_moves,
+                    key=lambda m: m.base_power
+                                  * (1.5 if m.type in active.types else 1)
+                                  * (
+                                      physical_ratio
+                                      if m.category == MoveCategory.PHYSICAL
+                                      else special_ratio
+                                  )
+                                  * m.accuracy
+                                  * m.expected_hits
+                                  * opponent.damage_multiplier(m),
+                )
             return self.create_order(
                 move,
-                dynamax=self._should_dynamax(battle, n_remaining_mons),
                 terastallize=should_tera
             )
 
