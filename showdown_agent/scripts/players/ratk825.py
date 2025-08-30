@@ -219,43 +219,54 @@ class CustomAgent(Player):
             if pokemon:
                 self.opponent_tracker.update_pokemon(pokemon.species, pokemon)
 
-    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon) -> float:
-        """Calculate matchup score between two Pokemon using proper type effectiveness"""
+    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon, battle: Optional[AbstractBattle] = None) -> float:
+        """
+        Matchup = (our best attack score) - (their rough best effectiveness into us)
+                + small speed/HP nudges.
+        Uses *our actual moves* (available this turn for the active, known moves for bench).
+        """
         if not mon or not opponent:
             return 0.0
-            
-        score = 0.0
-        
-        # Offensive advantage - how well our types hit opponent
-        if mon.types and opponent.types:
-            our_types = [str(t) for t in mon.types]
-            opp_types = [str(t) for t in opponent.types]
-            
-            # Best type effectiveness we can deal
-            best_offensive = max([
-                self._get_type_effectiveness(our_type, opp_types)
-                for our_type in our_types
-            ])
-            score += best_offensive
-            
-            # Best type effectiveness they can deal to us
-            best_defensive = max([
-                self._get_type_effectiveness(opp_type, our_types)
-                for opp_type in opp_types
-            ])
-            score -= best_defensive
-        
-        # Speed advantage
+
+        # 1) Our offense (use real moves)
+        if battle and battle.active_pokemon is mon and battle.available_moves:
+            our_best = self._best_attack_score(mon, opponent, battle.available_moves)
+        else:
+            our_best = self._best_attack_score(mon, opponent, self._my_known_moves(mon))
+
+        score = our_best
+
+        # 2) Their offense (coarse: assume best of their typing into ours)
+        our_types = [str(t) for t in (mon.types or [])]
+        opp_types = [str(t) for t in (opponent.types or [])]
+        worst_we_face = 1.0
+        for ot in opp_types:
+            worst_we_face = max(worst_we_face, self._get_type_effectiveness(str(ot), our_types))
+        score -= worst_we_face
+
+        # 3) Speed small nudge
         if mon.base_stats["spe"] > opponent.base_stats["spe"]:
             score += self.SPEED_TIER_COEFICIENT
         elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
             score -= self.SPEED_TIER_COEFICIENT
 
-        # HP advantage
+        # 4) HP small nudge
         score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
 
         return score
+
+    def _my_known_moves(self, mon: Pokemon):
+        """Return the list of Move objects we know for our Pokémon."""
+        # For your own team, poke-env populates `mon.moves` with your actual moves.
+        return list(getattr(mon, "moves", {}).values())
+
+    def _best_attack_score(self, attacker: Pokemon, defender: Pokemon, moves) -> float:
+        """Max estimated damage score among given moves (uses your estimator)."""
+        if not moves:
+            return 0.0
+        scores = [self._calculate_move_damage_estimate(m, attacker, defender) for m in moves if m]
+        return max(scores) if scores else 0.0
 
     def _should_terastallize(self, battle: AbstractBattle) -> bool:
         """Decide whether to use Tera this turn - more aggressive"""
@@ -265,7 +276,7 @@ class CustomAgent(Player):
         if not battle.can_tera or not active or not opponent or self._tera_used:
             return False
 
-        current_matchup = self._estimate_matchup(active, opponent)
+        current_matchup = self._estimate_matchup(active, opponent, battle)
         n_remaining = sum(1 for p in battle.team.values() if not p.fainted)
 
         # Emergency defensive Tera - more lenient HP threshold
@@ -310,7 +321,7 @@ class CustomAgent(Player):
         if battle.turn <= 1 or self._last_switched_turn >= battle.turn - 1:
             return False
 
-        current_matchup = self._estimate_matchup(active, opponent)
+        current_matchup = self._estimate_matchup(active, opponent, battle)
         
         # Check if we have a good switch option
         good_switches = [
@@ -455,6 +466,13 @@ class CustomAgent(Player):
                 
         return base_score
 
+    def _all_moves_bad(self, battle: AbstractBattle) -> bool:
+        a, d = battle.active_pokemon, battle.opponent_active_pokemon
+        if not a or not d or not battle.available_moves:
+            return False
+        scores = [self._calculate_move_damage_estimate(m, a, d) for m in battle.available_moves]
+        return max(scores, default=0.0) <= 0.0
+
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Main decision making method"""
         if isinstance(battle, DoubleBattle):
@@ -468,6 +486,11 @@ class CustomAgent(Player):
 
         if not active or not opponent:
             return self.choose_random_move(battle)
+
+        if self._all_moves_bad(battle) and battle.available_switches:
+            self._last_switched_turn = battle.turn
+            best_switch = max(battle.available_switches, key=lambda s: self._estimate_matchup(s, opponent))
+            return self.create_order(best_switch)
 
         # Decide on Tera usage
         should_tera = self._should_terastallize(battle)
