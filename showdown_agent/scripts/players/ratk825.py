@@ -310,7 +310,7 @@ class CustomAgent(Player):
         self.SETUP_MOVES = {"swordsdance", "nastyplot", "calmmind", "dragondance", "agility"}
         self.SPEED_TIER_COEFICIENT = 0.1
         self.HP_FRACTION_COEFICIENT = 0.4
-        self.SWITCH_OUT_MATCHUP_THRESHOLD = -1.5  # Made less conservative
+        self.SWITCH_OUT_MATCHUP_THRESHOLD = -2.5  # More conservative - don't switch good positions
         
         # Game theory parameters
         self.PREDICTION_CONFIDENCE_THRESHOLD = 0.7
@@ -420,6 +420,17 @@ class CustomAgent(Player):
         # Update opponent tracking
         self.opponent_tracker.update_pokemon(opponent.species, opponent)
         
+        # NEVER SWITCH IN KEY WINNING MATCHUPS!
+        winning_matchups = [
+            (active.species == 'Kingambit' and opponent.species == 'Koraidon'),
+            (active.species == 'Arceus-Fairy' and opponent.species == 'Deoxys-Speed'),
+            (active.species == 'Eternatus' and opponent.species == 'Arceus-Fairy'),
+        ]
+        
+        if any(winning_matchups):
+            print(f"DEBUG: {active.species} vs {opponent.species} - NEVER SWITCH! This is a winning matchup.")
+            return False
+        
         # Never switch out on turn 1 unless we're completely hopeless
         if self.turn_count <= 1:
             current_matchup = self._estimate_matchup(active, opponent)
@@ -500,6 +511,7 @@ class CustomAgent(Player):
         # CRITICAL: Kingambit vs Koraidon MUST use Sucker Punch
         if (active.species == 'Kingambit' and opponent.species == 'Koraidon' and 
             move.id == 'suckerpunch'):
+            print(f"DEBUG: Sucker Punch getting max priority vs Koraidon")
             return 999999  # Force Sucker Punch selection
         
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
@@ -581,6 +593,18 @@ class CustomAgent(Player):
             # This is a simplified way - in a real implementation you'd parse the battle log
             pass
 
+        # Always check for priority moves first, regardless of switching logic
+        if battle.available_moves:
+            # PRIORITY: Use Sucker Punch if Kingambit faces any physical attacker
+            if active.species == 'Kingambit':
+                sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
+                if sucker_punch:
+                    # Use Sucker Punch against likely physical attackers
+                    physical_attackers = ['Koraidon', 'Zacian-Crowned', 'Kingambit']
+                    if opponent.species in physical_attackers and opponent.current_hp_fraction > 0.3:
+                        print(f"DEBUG: {active.species} using Sucker Punch vs {opponent.species}!")
+                        return self.create_order(sucker_punch)
+        
         if battle.available_moves and (
                 not self._should_switch_out(battle) or not battle.available_switches
         ):
@@ -659,12 +683,7 @@ class CustomAgent(Player):
                     elif current_matchup > 1.0:
                         return self.create_order(setup_moves[0])
 
-            # CRITICAL MATCHUP LOGIC - Keep it simple
-            if opponent.species == 'Koraidon' and active.species == 'Kingambit':
-                sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
-                if sucker_punch:
-                    # Always use Sucker Punch vs Koraidon - they will attack 90% of the time
-                    return self.create_order(sucker_punch)
+            # Don't duplicate Sucker Punch logic - it's handled above now
             
             # Eternatus mirror - prioritize speed
             if opponent.species == 'Eternatus' and active.species == 'Eternatus':
@@ -726,11 +745,11 @@ class CustomAgent(Player):
             for species, pokemon in battle.opponent_team.items():
                 self.opponent_tracker.team_preview_seen.add(species)
         
-        # Lead Kingambit 50% of the time to counter simple-uber's Koraidon leads
-        if self.battle_count % 2 == 1:  # Battles 1, 3, 5, 7... (odd numbers)
-            preferred_lead = "Kingambit"
-        else:  # Battles 2, 4, 6, 8... (even numbers)
-            preferred_lead = "Deoxys-Speed" 
+        # Lead Kingambit MUCH more often - simple-uber is beating us
+        if self.battle_count % 4 == 3:  # Only 1 out of 4 battles lead Deoxys
+            preferred_lead = "Deoxys-Speed"
+        else:  # 3 out of 4 battles lead Kingambit
+            preferred_lead = "Kingambit" 
         
         # Find the preferred lead
         team_list = list(battle.team.values())
