@@ -420,81 +420,28 @@ class CustomAgent(Player):
         # Update opponent tracking
         self.opponent_tracker.update_pokemon(opponent.species, opponent)
         
-        # NEVER SWITCH IN KEY WINNING MATCHUPS!
-        winning_matchups = [
-            (active.species == 'Kingambit' and opponent.species == 'Koraidon'),
-            (active.species == 'Arceus-Fairy' and opponent.species == 'Deoxys-Speed'),
-            (active.species == 'Eternatus' and opponent.species == 'Arceus-Fairy'),
-        ]
-        
-        if any(winning_matchups):
-            print(f"DEBUG: {active.species} vs {opponent.species} - NEVER SWITCH! This is a winning matchup.")
+        # KINGAMBIT MUST NEVER SWITCH VS KORAIDON - IT HAS SUCKER PUNCH ADVANTAGE!
+        if active.species == 'Kingambit' and opponent.species == 'Koraidon':
             return False
         
-        # Never switch out on turn 1 unless we're completely hopeless
-        if self.turn_count <= 1:
-            current_matchup = self._estimate_matchup(active, opponent)
-            # Only switch if we're getting completely destroyed
-            if current_matchup < -3.0:
-                good_switches = [m for m in battle.available_switches if self._estimate_matchup(m, opponent) > 1.0]
-                return len(good_switches) > 0
-            return False
-        
-        # If there is a decent switch in...
-        good_switches = [
-            m for m in battle.available_switches
-            if self._estimate_matchup(m, opponent) > self._estimate_matchup(active, opponent) + 0.5
-        ]
-        
-        if good_switches:
-            current_matchup = self._estimate_matchup(active, opponent)
-            
-            # Critical HP - stay and fight if we can do damage
-            if active.current_hp_fraction <= 0.3:
-                # Stay if we can potentially KO
-                can_ko = any(
-                    move.base_power * opponent.damage_multiplier(move) > opponent.current_hp * 100
-                    for move in battle.available_moves
-                )
-                if can_ko:
+        # NEVER SWITCH UNLESS LITERALLY DYING
+        # Only switch if we're at critical health (5% or less) AND have no offensive moves
+        if active.current_hp_fraction <= 0.05:  # Only at 5% HP or less
+            # Check if we have any decent attacking moves first
+            if battle.available_moves:
+                attacking_moves = [m for m in battle.available_moves if m.base_power and m.base_power > 0]
+                if attacking_moves:
                     return False
             
-            # Enhanced switching logic with game theory
-            switch_likelihood = self.opponent_tracker.predict_switch_likelihood(
-                -current_matchup,  # Negative because it's from their perspective
-                opponent.species
-            )
-            
-            # Standard reasons to switch (but be more conservative)
-            if active.boosts["def"] <= -4 or active.boosts["spd"] <= -4:
+            # Only switch if we have a MUCH better option
+            good_switches = [
+                m for m in battle.available_switches
+                if self._estimate_matchup(m, opponent) > 2.0  # Need overwhelming advantage
+            ]
+            if good_switches:
                 return True
-            if (
-                    active.boosts["atk"] <= -4
-                    and active.stats["atk"] >= active.stats["spa"]
-            ):
-                return True
-            if (
-                    active.boosts["spa"] <= -4
-                    and active.stats["atk"] <= active.stats["spa"]
-            ):
-                return True
-            
-            # Enhanced matchup-based switching
-            if current_matchup < self.SWITCH_OUT_MATCHUP_THRESHOLD:
-                # If opponent is likely to switch, we might want to stay to punish
-                if switch_likelihood > 0.6 and current_matchup > -2.5:
-                    return False  # Stay to catch their switch
-                return True
-            
-            # In mirror matches, be more aggressive about gaining position
-            is_mirror = opponent.species == active.species
-            if is_mirror and current_matchup < -0.3:
-                return True
-                
-            # Don't switch if we're in a decent position
-            if current_matchup > -0.5 and active.current_hp_fraction > 0.6:
-                return False
         
+        # NEVER SWITCH otherwise - ALWAYS stay and fight!
         return False
 
     def _stat_estimation(self, mon: Pokemon, stat: str):
@@ -508,11 +455,13 @@ class CustomAgent(Player):
     def _calculate_move_value(self, move, active: Pokemon, opponent: Pokemon, battle: AbstractBattle):
         """Simple move evaluation that works"""
         
-        # CRITICAL: Kingambit vs Koraidon MUST use Sucker Punch
-        if (active.species == 'Kingambit' and opponent.species == 'Koraidon' and 
-            move.id == 'suckerpunch'):
-            print(f"DEBUG: Sucker Punch getting max priority vs Koraidon")
-            return 999999  # Force Sucker Punch selection
+        # CRITICAL: Kingambit ALWAYS prefers Sucker Punch vs physical attackers
+        if active.species == 'Kingambit' and move.id == 'suckerpunch':
+            physical_attackers = ['Koraidon', 'Zacian-Crowned', 'Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
+            if opponent.species in physical_attackers:
+                return 999999  # Force Sucker Punch selection
+            else:
+                return 100000  # Still very high value against others
         
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
         special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
@@ -593,17 +542,18 @@ class CustomAgent(Player):
             # This is a simplified way - in a real implementation you'd parse the battle log
             pass
 
-        # Always check for priority moves first, regardless of switching logic
-        if battle.available_moves:
-            # PRIORITY: Use Sucker Punch if Kingambit faces any physical attacker
-            if active.species == 'Kingambit':
-                sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
-                if sucker_punch:
-                    # Use Sucker Punch against likely physical attackers
-                    physical_attackers = ['Koraidon', 'Zacian-Crowned', 'Kingambit']
-                    if opponent.species in physical_attackers and opponent.current_hp_fraction > 0.3:
-                        print(f"DEBUG: {active.species} using Sucker Punch vs {opponent.species}!")
-                        return self.create_order(sucker_punch)
+        # KINGAMBIT PRIORITY LOGIC - SUCKER PUNCH IS EVERYTHING!
+        if battle.available_moves and active.species == 'Kingambit':
+            sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
+            if sucker_punch:
+                # Use Sucker Punch against ALL physical attackers - especially Koraidon!
+                physical_attackers = ['Koraidon', 'Zacian-Crowned', 'Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
+                if opponent.species in physical_attackers:
+                    # Force Sucker Punch - don't even consider other moves
+                    return self.create_order(sucker_punch)
+                # Even use it against special attackers if they might have physical moves
+                elif opponent.species in ['Eternatus', 'Deoxys-Speed', 'Arceus-Fairy']:
+                    return self.create_order(sucker_punch)
         
         if battle.available_moves and (
                 not self._should_switch_out(battle) or not battle.available_switches
@@ -745,11 +695,11 @@ class CustomAgent(Player):
             for species, pokemon in battle.opponent_team.items():
                 self.opponent_tracker.team_preview_seen.add(species)
         
-        # Lead Kingambit MUCH more often - simple-uber is beating us
-        if self.battle_count % 4 == 3:  # Only 1 out of 4 battles lead Deoxys
-            preferred_lead = "Deoxys-Speed"
-        else:  # 3 out of 4 battles lead Kingambit
-            preferred_lead = "Kingambit" 
+        # Lead Kingambit almost every time - it's our best Pokemon
+        if self.battle_count % 10 == 0:  # Only 1 out of 10 battles lead something else
+            preferred_lead = "Arceus-Fairy"  # Tanky alternative
+        else:  # 9 out of 10 battles lead Kingambit
+            preferred_lead = "Kingambit"
         
         # Find the preferred lead
         team_list = list(battle.team.values())
@@ -776,5 +726,4 @@ class CustomAgent(Player):
     
     def choose_default_move(self, battle):
         """Last resort - choose team on battle start if teampreview failed"""
-        print(f"DEBUG: choose_default_move called - teampreview may have failed!")
         return self.teampreview(battle)
