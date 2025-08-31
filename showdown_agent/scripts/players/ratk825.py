@@ -297,6 +297,7 @@ class CustomAgent(Player):
         self.turn_count = 0
         self.our_last_move = None
         self.opponent_last_move = None
+        self.battle_count = 0  # Track number of battles for lead selection
         
         # Constants for decision-making
         self.ENTRY_HAZARDS = {
@@ -347,6 +348,42 @@ class CustomAgent(Player):
         
         return score
 
+    def _would_tera_help(self, active: Pokemon, opponent: Pokemon) -> bool:
+        """Check if Terastallizing would actually improve the matchup"""
+        if not hasattr(active, 'tera_type') or not active.tera_type:
+            return False
+            
+        # Get current type effectiveness
+        current_weakness = max([active.damage_multiplier(t) for t in opponent.types if t is not None])
+        current_resistance = max([opponent.damage_multiplier(t) for t in active.types if t is not None])
+        
+        # Simulate tera type matchup (simplified)
+        tera_type_str = str(active.tera_type)
+        
+        # Common tera type advantages we know about
+        tera_improvements = {
+            # Arceus-Fairy to Fire helps vs Steel types but hurts vs Water/Ground
+            ('arceusfairy', 'fire'): {'good_vs': ['steel', 'grass', 'ice', 'bug'], 'bad_vs': ['water', 'ground', 'rock']},
+            # Zacian to Flying helps vs Fighting/Ground
+            ('zaciancrowned', 'flying'): {'good_vs': ['fighting', 'ground', 'grass', 'bug'], 'bad_vs': ['electric', 'ice', 'rock']},
+        }
+        
+        active_key = active.species.lower().replace('-', '')
+        tera_key = tera_type_str.lower()
+        
+        if (active_key, tera_key) in tera_improvements:
+            improvement = tera_improvements[(active_key, tera_key)]
+            opponent_types = [str(t).lower() for t in opponent.types if t is not None]
+            
+            # Check if opponent has types we're good against after tera
+            helps = any(opp_type in improvement['good_vs'] for opp_type in opponent_types)
+            hurts = any(opp_type in improvement['bad_vs'] for opp_type in opponent_types)
+            
+            return helps and not hurts
+        
+        # Default: only tera if we're weak to opponent
+        return current_weakness > 1.5
+    
     def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
         if not battle.can_tera:
             return False
@@ -359,38 +396,32 @@ class CustomAgent(Player):
         
         current_matchup = self._estimate_matchup(active, opponent)
         
-        # Critical situations - always tera
+        # Critical situations - always tera if it would help
         if n_remaining_mons == 1:
-            return True
+            return self._would_tera_help(active, opponent)
         
-        # Last full HP mon
+        # Last full HP mon - but only if tera actually improves matchup
         full_hp_mons = [m for m in battle.team.values() if m.current_hp_fraction == 1]
         if len(full_hp_mons) == 1 and active.current_hp_fraction == 1:
+            return self._would_tera_help(active, opponent)
+        
+        # Don't tera in bad matchups unless it fixes the matchup
+        if current_matchup < -0.5:
+            return self._would_tera_help(active, opponent) and n_remaining_mons <= 3
+        
+        # In mirror matches, be more aggressive with tera
+        is_mirror_match = len([p for p in battle.opponent_team.values() if p.species == active.species]) > 0
+        
+        if is_mirror_match and current_matchup > 0 and active.current_hp_fraction >= 0.8:
+            return self._would_tera_help(active, opponent)
+        
+        # Standard good matchup tera - but verify it actually helps
+        if (
+            current_matchup > 0.5 and 
+            active.current_hp_fraction >= 0.8 and
+            self._would_tera_help(active, opponent)
+        ):
             return True
-        
-        # Enhanced tera logic with opponent profiling
-        if current_matchup > 0.5 and active.current_hp_fraction >= 0.8:
-            # Against aggressive opponents, tera early to secure advantage
-            if self.opponent_tracker.profile.aggression_level > 0.7:
-                return True
-            
-            # Against setup-heavy opponents, tera to prevent their setup
-            if self.opponent_tracker.profile.setup_preference > 0.4:
-                return True
-                
-            # Standard good matchup tera
-            if (
-                active.current_hp_fraction == 1 and 
-                opponent.current_hp_fraction == 1
-            ):
-                return True
-        
-        # Defensive tera when in trouble
-        if current_matchup < -1.0 and active.current_hp_fraction < 0.5:
-            # Check if tera would significantly improve our defensive matchup
-            # This is a simplification - would need more complex type analysis
-            if n_remaining_mons <= 2:
-                return True
         
         return False
 
@@ -398,18 +429,39 @@ class CustomAgent(Player):
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
         
+        if not active or not opponent:
+            return False
+        
         # Update opponent tracking
-        if opponent:
-            self.opponent_tracker.update_pokemon(opponent.species, opponent)
+        self.opponent_tracker.update_pokemon(opponent.species, opponent)
+        
+        # Never switch out on turn 1 unless we're completely hopeless
+        if self.turn_count <= 1:
+            current_matchup = self._estimate_matchup(active, opponent)
+            # Only switch if we're getting completely destroyed
+            if current_matchup < -3.0:
+                good_switches = [m for m in battle.available_switches if self._estimate_matchup(m, opponent) > 1.0]
+                return len(good_switches) > 0
+            return False
         
         # If there is a decent switch in...
         good_switches = [
             m for m in battle.available_switches
-            if self._estimate_matchup(m, opponent) > 0
+            if self._estimate_matchup(m, opponent) > self._estimate_matchup(active, opponent) + 0.5
         ]
         
         if good_switches:
             current_matchup = self._estimate_matchup(active, opponent)
+            
+            # Critical HP - stay and fight if we can do damage
+            if active.current_hp_fraction <= 0.3:
+                # Stay if we can potentially KO
+                can_ko = any(
+                    move.base_power * opponent.damage_multiplier(move) > opponent.current_hp * 100
+                    for move in battle.available_moves
+                )
+                if can_ko:
+                    return False
             
             # Enhanced switching logic with game theory
             switch_likelihood = self.opponent_tracker.predict_switch_likelihood(
@@ -417,16 +469,16 @@ class CustomAgent(Player):
                 opponent.species
             )
             
-            # Standard reasons to switch
-            if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
+            # Standard reasons to switch (but be more conservative)
+            if active.boosts["def"] <= -4 or active.boosts["spd"] <= -4:
                 return True
             if (
-                    active.boosts["atk"] <= -3
+                    active.boosts["atk"] <= -4
                     and active.stats["atk"] >= active.stats["spa"]
             ):
                 return True
             if (
-                    active.boosts["spa"] <= -3
+                    active.boosts["spa"] <= -4
                     and active.stats["atk"] <= active.stats["spa"]
             ):
                 return True
@@ -438,14 +490,14 @@ class CustomAgent(Player):
                     return False  # Stay to catch their switch
                 return True
             
-            # Mind games: sometimes switch when they don't expect it
-            if (
-                current_matchup > -0.5 and switch_likelihood < 0.3 and 
-                self.opponent_tracker.profile.risk_tolerance > 0.6 and
-                len(good_switches) > 0
-            ):
-                # Occasional unexpected switch to throw off predictable opponents
+            # In mirror matches, be more aggressive about gaining position
+            is_mirror = opponent.species == active.species
+            if is_mirror and current_matchup < -0.3:
                 return True
+                
+            # Don't switch if we're in a decent position
+            if current_matchup > -0.5 and active.current_hp_fraction > 0.6:
+                return False
         
         return False
 
@@ -524,6 +576,10 @@ class CustomAgent(Player):
 
         if active is None or opponent is None:
             return self.choose_random_move(battle)
+        
+        # Track if this is a new battle
+        if self.turn_count == 1:
+            self.battle_count += 1
 
         # Update opponent tracking
         if opponent:
@@ -585,11 +641,13 @@ class CustomAgent(Player):
                 ):
                     return self.create_order(move)
 
-            # Enhanced setup logic
+            # Enhanced setup logic - but be more careful in mirrors
             current_matchup = self._estimate_matchup(active, opponent)
+            is_mirror_match = active.species == opponent.species
+            
             if (
                     active.current_hp_fraction >= 0.8
-                    and current_matchup > 0.5
+                    and current_matchup > (0.8 if is_mirror_match else 0.5)
             ):
                 setup_moves = [
                     move for move in battle.available_moves
@@ -600,19 +658,51 @@ class CustomAgent(Player):
                 ]
                 
                 if setup_moves:
-                    # Less likely to setup against aggressive opponents who won't let us
-                    if self.opponent_tracker.profile.aggression_level < 0.6:
+                    # In mirrors, only setup if we have a clear advantage
+                    if is_mirror_match:
+                        if current_matchup > 1.2 and opponent.current_hp_fraction < active.current_hp_fraction:
+                            return self.create_order(setup_moves[0])
+                    # Against different Pokemon, use normal logic
+                    elif self.opponent_tracker.profile.aggression_level < 0.6:
                         return self.create_order(setup_moves[0])
-                    elif current_matchup > 1.0:  # Only if we have a really good matchup
+                    elif current_matchup > 1.0:
                         return self.create_order(setup_moves[0])
 
+            # Special logic for critical matchups
+            if opponent.species == 'Koraidon' and active.species == 'Kingambit':
+                # Kingambit vs Koraidon - use Sucker Punch if they're likely to attack
+                sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
+                if sucker_punch and opponent.current_hp_fraction > 0.5:
+                    # High chance Koraidon will use Scale Shot or Close Combat
+                    return self.create_order(sucker_punch)
+            
+            # Eternatus mirror - prioritize speed
+            if opponent.species == 'Eternatus' and active.species == 'Eternatus':
+                # Use Agility if we're at full HP and they are too
+                agility_move = next((move for move in battle.available_moves if move.id == 'agility'), None)
+                if agility_move and active.current_hp_fraction == 1.0 and opponent.current_hp_fraction > 0.8:
+                    return self.create_order(agility_move)
+            
+            # Zacian mirrors - go for the KO
+            if opponent.species == 'Zacian-Crowned' and active.species == 'Zacian-Crowned':
+                behemoth_blade = next((move for move in battle.available_moves if move.id == 'behemothblade'), None)
+                if behemoth_blade:
+                    return self.create_order(behemoth_blade)
+            
+            if opponent.species == 'Zacian-Crowned' and active.species == 'Arceus-Fairy':
+                # Don't tera to Fire vs Zacian - it resists Fire
+                should_tera = False
+            else:
+                should_tera = self._should_tera(battle, n_remaining_mons)
+            
             # Choose best attacking move with enhanced evaluation
             best_move = max(
                 battle.available_moves,
                 key=lambda m: self._calculate_move_value(m, active, opponent, battle)
             )
             
-            should_tera = self._should_tera(battle, n_remaining_mons)
+            if 'should_tera' not in locals():
+                should_tera = self._should_tera(battle, n_remaining_mons)
             return self.create_order(best_move, terastallize=should_tera)
 
         if battle.available_switches:
@@ -633,3 +723,28 @@ class CustomAgent(Player):
             return self.create_order(best_switch)
 
         return self.choose_random_move(battle)
+    
+    def choose_leads(self, battle):
+        """Override lead selection to vary strategy"""
+        # Analyze team preview if available
+        if hasattr(battle, 'opponent_team') and battle.opponent_team:
+            for species, pokemon in battle.opponent_team.items():
+                self.opponent_tracker.team_preview_seen.add(species)
+        
+        # Lead selection strategy based on battle count
+        leads = {
+            0: "Deoxys-Speed",      # Standard hazard lead
+            1: "Kingambit",         # Aggressive lead to catch Koraidon
+            2: "Zacian-Crowned",    # Fast offensive lead  
+            3: "Arceus-Fairy",      # Defensive lead
+        }
+        
+        preferred_lead = leads.get(self.battle_count % 4, "Deoxys-Speed")
+        
+        # Find the preferred lead in our team
+        for pokemon in battle.team.values():
+            if preferred_lead.lower() in pokemon.species.lower():
+                return [pokemon]
+        
+        # Fallback to first available
+        return [next(iter(battle.team.values()))]
