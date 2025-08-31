@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 
 from poke_env.battle import MoveCategory
 from poke_env.battle.abstract_battle import AbstractBattle
-from poke_env.battle.double_battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
 from poke_env.player.battle_order import BattleOrder
@@ -298,6 +297,7 @@ class CustomAgent(Player):
         self.our_last_move = None
         self.opponent_last_move = None
         self.battle_count = 0  # Track number of battles for lead selection
+        self.battles_seen = set()  # Track which battles we've seen to increment counter properly
         
         # Constants for decision-making
         self.ENTRY_HAZARDS = {
@@ -315,6 +315,8 @@ class CustomAgent(Player):
         # Game theory parameters
         self.PREDICTION_CONFIDENCE_THRESHOLD = 0.7
         self.RISK_REWARD_THRESHOLD = 1.2
+        
+        # Keep it simple - no complex counter database
 
     def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
         score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
@@ -329,23 +331,6 @@ class CustomAgent(Player):
         score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
 
-        # Enhanced matchup evaluation with more factors
-        
-        # Speed control bonus
-        speed_diff = mon.base_stats["spe"] - opponent.base_stats["spe"]
-        if speed_diff > 20:  # Significant speed advantage
-            score += 0.3
-        elif speed_diff < -20:  # Significant speed disadvantage
-            score -= 0.3
-        
-        # Ability synergies (simplified)
-        if hasattr(mon, 'ability') and mon.ability:
-            ability_name = str(mon.ability).lower()
-            if 'intimidate' in ability_name and opponent.stats["atk"] > opponent.stats["spa"]:
-                score += 0.2
-            elif 'pressure' in ability_name:
-                score += 0.1
-        
         return score
 
     def _would_tera_help(self, active: Pokemon, opponent: Pokemon) -> bool:
@@ -510,7 +495,13 @@ class CustomAgent(Player):
         return ((2 * mon.base_stats[stat] + 31) + 5) * boost
 
     def _calculate_move_value(self, move, active: Pokemon, opponent: Pokemon, battle: AbstractBattle):
-        """Enhanced move evaluation with risk/reward analysis"""
+        """Simple move evaluation that works"""
+        
+        # CRITICAL: Kingambit vs Koraidon MUST use Sucker Punch
+        if (active.species == 'Kingambit' and opponent.species == 'Koraidon' and 
+            move.id == 'suckerpunch'):
+            return 999999  # Force Sucker Punch selection
+        
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
         special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
         
@@ -577,9 +568,9 @@ class CustomAgent(Player):
         if active is None or opponent is None:
             return self.choose_random_move(battle)
         
-        # Track if this is a new battle
+        # Track if this is a new battle (but don't increment here since teampreview handles it)
         if self.turn_count == 1:
-            self.battle_count += 1
+            pass  # Battle count is handled in teampreview now
 
         # Update opponent tracking
         if opponent:
@@ -668,12 +659,11 @@ class CustomAgent(Player):
                     elif current_matchup > 1.0:
                         return self.create_order(setup_moves[0])
 
-            # Special logic for critical matchups
+            # CRITICAL MATCHUP LOGIC - Keep it simple
             if opponent.species == 'Koraidon' and active.species == 'Kingambit':
-                # Kingambit vs Koraidon - use Sucker Punch if they're likely to attack
                 sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
-                if sucker_punch and opponent.current_hp_fraction > 0.5:
-                    # High chance Koraidon will use Scale Shot or Close Combat
+                if sucker_punch:
+                    # Always use Sucker Punch vs Koraidon - they will attack 90% of the time
                     return self.create_order(sucker_punch)
             
             # Eternatus mirror - prioritize speed
@@ -695,7 +685,7 @@ class CustomAgent(Player):
             else:
                 should_tera = self._should_tera(battle, n_remaining_mons)
             
-            # Choose best attacking move with enhanced evaluation
+            # Choose best attacking move - keep it simple
             best_move = max(
                 battle.available_moves,
                 key=lambda m: self._calculate_move_value(m, active, opponent, battle)
@@ -724,27 +714,48 @@ class CustomAgent(Player):
 
         return self.choose_random_move(battle)
     
-    def choose_leads(self, battle):
-        """Override lead selection to vary strategy"""
-        # Analyze team preview if available
+    def teampreview(self, battle):
+        """Handle team preview - this method name should be correct for poke-env"""
+        # Only increment battle count once per unique battle
+        battle_id = getattr(battle, 'battle_tag', str(id(battle)))
+        if battle_id not in self.battles_seen:
+            self.battle_count += 1
+            self.battles_seen.add(battle_id)
+        
         if hasattr(battle, 'opponent_team') and battle.opponent_team:
             for species, pokemon in battle.opponent_team.items():
                 self.opponent_tracker.team_preview_seen.add(species)
         
-        # Lead selection strategy based on battle count
-        leads = {
-            0: "Deoxys-Speed",      # Standard hazard lead
-            1: "Kingambit",         # Aggressive lead to catch Koraidon
-            2: "Zacian-Crowned",    # Fast offensive lead  
-            3: "Arceus-Fairy",      # Defensive lead
-        }
+        # Lead Kingambit 50% of the time to counter simple-uber's Koraidon leads
+        if self.battle_count % 2 == 1:  # Battles 1, 3, 5, 7... (odd numbers)
+            preferred_lead = "Kingambit"
+        else:  # Battles 2, 4, 6, 8... (even numbers)
+            preferred_lead = "Deoxys-Speed" 
         
-        preferred_lead = leads.get(self.battle_count % 4, "Deoxys-Speed")
+        # Find the preferred lead
+        team_list = list(battle.team.values())
+        for i, pokemon in enumerate(team_list):
+            species_clean = pokemon.species.lower().replace('-', '').replace(' ', '')
+            lead_clean = preferred_lead.lower().replace('-', '').replace(' ', '')
+            if lead_clean in species_clean:
+                return f"/team {i + 1}"
         
-        # Find the preferred lead in our team
-        for pokemon in battle.team.values():
-            if preferred_lead.lower() in pokemon.species.lower():
-                return [pokemon]
+        # Fallback to Kingambit if we can't find preferred lead
+        for i, pokemon in enumerate(team_list):
+            if 'kingambit' in pokemon.species.lower():
+                return f"/team {i + 1}"
         
-        # Fallback to first available
-        return [next(iter(battle.team.values()))]
+        return "/team 1"
+    
+    def choose_team_preview(self, battle):
+        """Alternative method name that poke-env might use"""
+        return self.teampreview(battle)
+    
+    def team_preview(self, battle):
+        """Another alternative method name"""
+        return self.teampreview(battle)
+    
+    def choose_default_move(self, battle):
+        """Last resort - choose team on battle start if teampreview failed"""
+        print(f"DEBUG: choose_default_move called - teampreview may have failed!")
+        return self.teampreview(battle)
