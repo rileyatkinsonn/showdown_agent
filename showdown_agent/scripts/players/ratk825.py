@@ -245,9 +245,6 @@ class CustomAgent(Player):
         return ((2 * mon.base_stats[stat] + 31) + 5) * boost
 
     def choose_move(self, battle: AbstractBattle):
-        if isinstance(battle, DoubleBattle):
-            return self.choose_random_doubles_move(battle)
-
         # Main mons shortcuts
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
