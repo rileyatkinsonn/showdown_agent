@@ -184,8 +184,8 @@ class CustomAgent(Player):
 
         return score
 
-    def _should_dynamax(self, battle: AbstractBattle, n_remaining_mons: int):
-        if battle.can_dynamax:
+    def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
+        if battle.can_tera:
             # Last full HP mon
             if (
                     len([m for m in battle.team.values() if m.current_hp_fraction == 1])
@@ -275,7 +275,6 @@ class CustomAgent(Player):
 
             # Entry hazard...
             for move in battle.available_moves:
-                # ...setup
                 if (
                         n_opp_remaining_mons >= 3
                         and move.id in self.ENTRY_HAZARDS
@@ -322,9 +321,7 @@ class CustomAgent(Player):
                               * m.expected_hits
                               * opponent.damage_multiplier(m),
             )
-            return self.create_order(
-                move, dynamax=self._should_dynamax(battle, n_remaining_mons)
-            )
+            return self.create_order(move, terastallize=self._should_tera(battle, n_remaining_mons))
 
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
