@@ -457,7 +457,12 @@ class CustomAgent(Player):
         
         # CRITICAL: Kingambit ALWAYS prefers Sucker Punch vs physical attackers
         if active.species == 'Kingambit' and move.id == 'suckerpunch':
-            physical_attackers = ['Koraidon', 'Zacian-Crowned', 'Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
+            # Absolutely maximum priority for Koraidon
+            if opponent.species == 'Koraidon':
+                return 99999999  # EXTREME priority vs Koraidon
+            
+            # High priority vs other physical attackers
+            physical_attackers = ['Zacian-Crowned', 'Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
             if opponent.species in physical_attackers:
                 return 999999  # Force Sucker Punch selection
             else:
@@ -529,6 +534,22 @@ class CustomAgent(Player):
         if active is None or opponent is None:
             return self.choose_random_move(battle)
         
+        # NUCLEAR OPTION: Kingambit vs Koraidon = ONLY SUCKER PUNCH, NO EXCEPTIONS
+        if active.species == 'Kingambit' and opponent.species == 'Koraidon':
+            print("urmom")
+            for move in battle.available_moves:
+                if move.id == 'suckerpunch':
+                    return self.create_order(move)
+            # If somehow no Sucker Punch, fall back to any move
+            return self.choose_random_move(battle)
+        
+        # ALSO: Kingambit vs Zacian should use Sucker Punch too
+        if active.species == 'Kingambit' and opponent.species == 'Zacian-Crowned':
+            print("urmom")
+            for move in battle.available_moves:
+                if move.id == 'suckerpunch':
+                    return self.create_order(move)
+        
         # Track if this is a new battle (but don't increment here since teampreview handles it)
         if self.turn_count == 1:
             pass  # Battle count is handled in teampreview now
@@ -542,15 +563,15 @@ class CustomAgent(Player):
             # This is a simplified way - in a real implementation you'd parse the battle log
             pass
 
-        # KINGAMBIT PRIORITY LOGIC - SUCKER PUNCH IS EVERYTHING!
+        # Additional Kingambit Sucker Punch logic for other matchups
         if battle.available_moves and active.species == 'Kingambit':
             sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
             if sucker_punch:
-                # Use Sucker Punch against ALL physical attackers - especially Koraidon!
-                physical_attackers = ['Koraidon', 'Zacian-Crowned', 'Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
+                # Use Sucker Punch against physical attackers (but Koraidon/Zacian already handled above)
+                physical_attackers = ['Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
                 if opponent.species in physical_attackers:
-                    # Force Sucker Punch - don't even consider other moves
                     return self.create_order(sucker_punch)
+                
                 # Even use it against special attackers if they might have physical moves
                 elif opponent.species in ['Eternatus', 'Deoxys-Speed', 'Arceus-Fairy']:
                     return self.create_order(sucker_punch)
