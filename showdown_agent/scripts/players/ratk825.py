@@ -462,7 +462,7 @@ class CustomAgent(Player):
                 return 99999999  # EXTREME priority vs Koraidon
             
             # High priority vs other physical attackers
-            physical_attackers = ['zaciancrowned', 'kingambit', 'arceusground', 'necrozmaduskmane']
+            physical_attackers = ['zacian', 'kingambit', 'arceusground', 'necrozmaduskmane']
             if opponent.species in physical_attackers:
                 return 999999  # Force Sucker Punch selection
             else:
@@ -533,15 +533,13 @@ class CustomAgent(Player):
 
         if active is None or opponent is None:
             return self.choose_random_move(battle)
-        
-        # Remove debug prints - too much spam
-        
+
         # SMART SUCKER PUNCH: Only vs physical attackers, NOT vs status Pokemon
         if active.species == 'kingambit':
             sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
             if sucker_punch:
                 # Use Sucker Punch vs physical attackers that will likely attack
-                physical_attackers = ['koraidon', 'zaciancrowned', 'kingambit']
+                physical_attackers = ['koraidon', 'zacian', 'kingambit']
                 if opponent.species in physical_attackers:
                     return self.create_order(sucker_punch)
                 
@@ -561,17 +559,28 @@ class CustomAgent(Player):
             # This is a simplified way - in a real implementation you'd parse the battle log
             pass
 
-        # Additional Kingambit Sucker Punch logic for other matchups
+        # KINGAMBIT MOVE SELECTION: Smart counter-play vs specific matchups
         if battle.available_moves and active.species == 'kingambit':
+            # VS DEOXYS: Never use Sucker Punch - it will use status moves. Use direct attacks!
+            if opponent.species in ['deoxysspeed', 'deoxysdefense', 'deoxysattack', 'deoxysnormal']:
+                # Use Kowtow Cleave or Iron Head - direct attacks that OHKO Deoxys
+                kowtow_cleave = next((move for move in battle.available_moves if move.id == 'kowtowcleave'), None)
+                iron_head = next((move for move in battle.available_moves if move.id == 'ironhead'), None)
+                if kowtow_cleave:
+                    return self.create_order(kowtow_cleave)
+                elif iron_head:
+                    return self.create_order(iron_head)
+            
+            # Additional Sucker Punch logic for other matchups (but NOT Deoxys!)
             sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
             if sucker_punch:
-                # Use Sucker Punch against physical attackers (but Koraidon/Zacian already handled above)
+                # Use Sucker Punch against physical attackers (but never Deoxys!)
                 physical_attackers = ['kingambit', 'arceusground', 'necrozmaduskmane']
                 if opponent.species in physical_attackers:
                     return self.create_order(sucker_punch)
                 
-                # Even use it against special attackers if they might have physical moves
-                elif opponent.species in ['eternatus', 'deoxysspeed', 'arceusfairy']:
+                # Only use vs Eternatus/Arceus if they're likely to attack (not Deoxys!)
+                elif opponent.species in ['eternatus', 'arceusfairy']:
                     return self.create_order(sucker_punch)
         
         if battle.available_moves and (
@@ -719,14 +728,13 @@ class CustomAgent(Player):
         # Kingambit has Dark moves but gets walled by status moves
         # Zacian and Arceus-Fairy are better vs Deoxys
         
-        preferred_lead = "zaciancrowned"  # Fast, strong, resists Psycho Boost, OHKO with Behemoth Blade
+        preferred_lead = "kingambit"  # Back to Kingambit, but with smarter move selection vs Deoxys
         
         # Find the preferred lead  
         team_list = list(battle.team.values())
         for i, pokemon in enumerate(team_list):
             if pokemon.species == preferred_lead:  # Direct match since both are lowercase
                 return f"/team {i + 1}"
-        
         # Fallback to Kingambit if we can't find preferred lead
         for i, pokemon in enumerate(team_list):
             if pokemon.species == 'kingambit':
