@@ -421,7 +421,7 @@ class CustomAgent(Player):
         self.opponent_tracker.update_pokemon(opponent.species, opponent)
         
         # KINGAMBIT MUST NEVER SWITCH VS KORAIDON - IT HAS SUCKER PUNCH ADVANTAGE!
-        if active.species == 'Kingambit' and opponent.species == 'Koraidon':
+        if active.species == 'kingambit' and opponent.species == 'koraidon':
             return False
         
         # NEVER SWITCH UNLESS LITERALLY DYING
@@ -456,13 +456,13 @@ class CustomAgent(Player):
         """Simple move evaluation that works"""
         
         # CRITICAL: Kingambit ALWAYS prefers Sucker Punch vs physical attackers
-        if active.species == 'Kingambit' and move.id == 'suckerpunch':
+        if active.species == 'kingambit' and move.id == 'suckerpunch':
             # Absolutely maximum priority for Koraidon
-            if opponent.species == 'Koraidon':
+            if opponent.species == 'koraidon':
                 return 99999999  # EXTREME priority vs Koraidon
             
             # High priority vs other physical attackers
-            physical_attackers = ['Zacian-Crowned', 'Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
+            physical_attackers = ['zaciancrowned', 'kingambit', 'arceusground', 'necrozmaduskmane']
             if opponent.species in physical_attackers:
                 return 999999  # Force Sucker Punch selection
             else:
@@ -534,21 +534,19 @@ class CustomAgent(Player):
         if active is None or opponent is None:
             return self.choose_random_move(battle)
         
-        # NUCLEAR OPTION: Kingambit vs Koraidon = ONLY SUCKER PUNCH, NO EXCEPTIONS
-        if active.species == 'Kingambit' and opponent.species == 'Koraidon':
-            print("urmom")
-            for move in battle.available_moves:
-                if move.id == 'suckerpunch':
-                    return self.create_order(move)
-            # If somehow no Sucker Punch, fall back to any move
-            return self.choose_random_move(battle)
+        # Remove debug prints - too much spam
         
-        # ALSO: Kingambit vs Zacian should use Sucker Punch too
-        if active.species == 'Kingambit' and opponent.species == 'Zacian-Crowned':
-            print("urmom")
-            for move in battle.available_moves:
-                if move.id == 'suckerpunch':
-                    return self.create_order(move)
+        # SMART SUCKER PUNCH: Only vs physical attackers, NOT vs status Pokemon
+        if active.species == 'kingambit':
+            sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
+            if sucker_punch:
+                # Use Sucker Punch vs physical attackers that will likely attack
+                physical_attackers = ['koraidon', 'zaciancrowned', 'kingambit']
+                if opponent.species in physical_attackers:
+                    return self.create_order(sucker_punch)
+                
+                # DON'T use Sucker Punch vs status Pokemon (Deoxys, Arceus with status moves)
+                # These will just make Sucker Punch fail
         
         # Track if this is a new battle (but don't increment here since teampreview handles it)
         if self.turn_count == 1:
@@ -564,16 +562,16 @@ class CustomAgent(Player):
             pass
 
         # Additional Kingambit Sucker Punch logic for other matchups
-        if battle.available_moves and active.species == 'Kingambit':
+        if battle.available_moves and active.species == 'kingambit':
             sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
             if sucker_punch:
                 # Use Sucker Punch against physical attackers (but Koraidon/Zacian already handled above)
-                physical_attackers = ['Kingambit', 'Arceus-Ground', 'Necrozma-Dusk-Mane']
+                physical_attackers = ['kingambit', 'arceusground', 'necrozmaduskmane']
                 if opponent.species in physical_attackers:
                     return self.create_order(sucker_punch)
                 
                 # Even use it against special attackers if they might have physical moves
-                elif opponent.species in ['Eternatus', 'Deoxys-Speed', 'Arceus-Fairy']:
+                elif opponent.species in ['eternatus', 'deoxysspeed', 'arceusfairy']:
                     return self.create_order(sucker_punch)
         
         if battle.available_moves and (
@@ -716,23 +714,22 @@ class CustomAgent(Player):
             for species, pokemon in battle.opponent_team.items():
                 self.opponent_tracker.team_preview_seen.add(species)
         
-        # Lead Kingambit almost every time - it's our best Pokemon
-        if self.battle_count % 10 == 0:  # Only 1 out of 10 battles lead something else
-            preferred_lead = "Arceus-Fairy"  # Tanky alternative
-        else:  # 9 out of 10 battles lead Kingambit
-            preferred_lead = "Kingambit"
+        # ANTI-DEOXYS STRATEGY: They always lead Deoxys, so counter it
+        # Deoxys is frail and weak to Ghost/Dark moves
+        # Kingambit has Dark moves but gets walled by status moves
+        # Zacian and Arceus-Fairy are better vs Deoxys
         
-        # Find the preferred lead
+        preferred_lead = "zaciancrowned"  # Fast, strong, resists Psycho Boost, OHKO with Behemoth Blade
+        
+        # Find the preferred lead  
         team_list = list(battle.team.values())
         for i, pokemon in enumerate(team_list):
-            species_clean = pokemon.species.lower().replace('-', '').replace(' ', '')
-            lead_clean = preferred_lead.lower().replace('-', '').replace(' ', '')
-            if lead_clean in species_clean:
+            if pokemon.species == preferred_lead:  # Direct match since both are lowercase
                 return f"/team {i + 1}"
         
         # Fallback to Kingambit if we can't find preferred lead
         for i, pokemon in enumerate(team_list):
-            if 'kingambit' in pokemon.species.lower():
+            if pokemon.species == 'kingambit':
                 return f"/team {i + 1}"
         
         return "/team 1"
