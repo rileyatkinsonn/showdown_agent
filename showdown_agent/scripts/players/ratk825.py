@@ -462,7 +462,7 @@ class CustomAgent(Player):
                 return 99999999  # EXTREME priority vs Koraidon
             
             # High priority vs other physical attackers
-            physical_attackers = ['zacian', 'kingambit', 'arceusground', 'necrozmaduskmane']
+            physical_attackers = ['zaciancrowned', 'kingambit']
             if opponent.species in physical_attackers:
                 return 999999  # Force Sucker Punch selection
             else:
@@ -539,10 +539,10 @@ class CustomAgent(Player):
             sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
             if sucker_punch:
                 # Use Sucker Punch vs physical attackers that will likely attack
-                physical_attackers = ['koraidon', 'zacian', 'kingambit']
+                physical_attackers = ['koraidon', 'zaciancrowned', 'kingambit']
                 if opponent.species in physical_attackers:
                     return self.create_order(sucker_punch)
-                
+
                 # DON'T use Sucker Punch vs status Pokemon (Deoxys, Arceus with status moves)
                 # These will just make Sucker Punch fail
         
@@ -562,7 +562,7 @@ class CustomAgent(Player):
         # KINGAMBIT MOVE SELECTION: Smart counter-play vs specific matchups
         if battle.available_moves and active.species == 'kingambit':
             # VS DEOXYS: Never use Sucker Punch - it will use status moves. Use direct attacks!
-            if opponent.species in ['deoxysspeed', 'deoxysdefense', 'deoxysattack', 'deoxysnormal']:
+            if opponent.species == 'deoxysspeed':
                 # Use Kowtow Cleave or Iron Head - direct attacks that OHKO Deoxys
                 kowtow_cleave = next((move for move in battle.available_moves if move.id == 'kowtowcleave'), None)
                 iron_head = next((move for move in battle.available_moves if move.id == 'ironhead'), None)
@@ -575,13 +575,33 @@ class CustomAgent(Player):
             sucker_punch = next((move for move in battle.available_moves if move.id == 'suckerpunch'), None)
             if sucker_punch:
                 # Use Sucker Punch against physical attackers (but never Deoxys!)
-                physical_attackers = ['kingambit', 'arceusground', 'necrozmaduskmane']
+                physical_attackers = ['kingambit']
                 if opponent.species in physical_attackers:
                     return self.create_order(sucker_punch)
                 
                 # Only use vs Eternatus/Arceus if they're likely to attack (not Deoxys!)
                 elif opponent.species in ['eternatus', 'arceusfairy']:
                     return self.create_order(sucker_punch)
+        
+        # ZACIAN MOVE SELECTION: Optimize for mirror matches and key threats
+        if battle.available_moves and active.species == 'zaciancrowned':
+            # VS ZACIAN MIRROR: Be aggressive, go for immediate damage
+            if opponent.species == 'zaciancrowned':
+                behemoth_blade = next((move for move in battle.available_moves if move.id == 'behemothblade'), None)
+                if behemoth_blade:
+                    return self.create_order(behemoth_blade)
+            
+            # VS KORAIDON: Use Close Combat for super effective damage
+            if opponent.species == 'koraidon':
+                close_combat = next((move for move in battle.available_moves if move.id == 'closecombat'), None)
+                if close_combat:
+                    return self.create_order(close_combat)
+                    
+            # VS KINGAMBIT: Use Close Combat for super effective damage
+            if opponent.species == 'kingambit':
+                close_combat = next((move for move in battle.available_moves if move.id == 'closecombat'), None)
+                if close_combat:
+                    return self.create_order(close_combat)
         
         if battle.available_moves and (
                 not self._should_switch_out(battle) or not battle.available_switches
@@ -664,29 +684,39 @@ class CustomAgent(Player):
             # Don't duplicate Sucker Punch logic - it's handled above now
             
             # Eternatus mirror - prioritize speed
-            if opponent.species == 'Eternatus' and active.species == 'Eternatus':
+            if opponent.species == 'eternatus' and active.species == 'eternatus':
                 # Use Agility if we're at full HP and they are too
                 agility_move = next((move for move in battle.available_moves if move.id == 'agility'), None)
                 if agility_move and active.current_hp_fraction == 1.0 and opponent.current_hp_fraction > 0.8:
                     return self.create_order(agility_move)
             
             # Zacian mirrors - go for the KO
-            if opponent.species == 'Zacian-Crowned' and active.species == 'Zacian-Crowned':
+            if opponent.species == 'zaciancrowned' and active.species == 'zaciancrowned':
                 behemoth_blade = next((move for move in battle.available_moves if move.id == 'behemothblade'), None)
                 if behemoth_blade:
                     return self.create_order(behemoth_blade)
             
-            if opponent.species == 'Zacian-Crowned' and active.species == 'Arceus-Fairy':
+            if opponent.species == 'zaciancrowned' and active.species == 'arceusfairy':
                 # Don't tera to Fire vs Zacian - it resists Fire
                 should_tera = False
             else:
                 should_tera = self._should_tera(battle, n_remaining_mons)
             
-            # Choose best attacking move - keep it simple
-            best_move = max(
-                battle.available_moves,
-                key=lambda m: self._calculate_move_value(m, active, opponent, battle)
-            )
+            # Choose best attacking move - prioritize high base power when ahead
+            n_remaining_mons = len([m for m in battle.team.values() if m.fainted is False])
+            n_opp_remaining_mons = 6 - len([m for m in battle.opponent_team.values() if m.fainted is True])
+            
+            # If we're ahead in numbers, be more aggressive with powerful moves
+            if n_remaining_mons > n_opp_remaining_mons:
+                best_move = max(
+                    battle.available_moves,
+                    key=lambda m: m.base_power * self._calculate_move_value(m, active, opponent, battle)
+                )
+            else:
+                best_move = max(
+                    battle.available_moves,
+                    key=lambda m: self._calculate_move_value(m, active, opponent, battle)
+                )
             
             if 'should_tera' not in locals():
                 should_tera = self._should_tera(battle, n_remaining_mons)
@@ -712,7 +742,7 @@ class CustomAgent(Player):
         return self.choose_random_move(battle)
     
     def teampreview(self, battle):
-        """Handle team preview - this method name should be correct for poke-env"""
+        """Handle team preview - choose lead Pokemon"""
         # Only increment battle count once per unique battle
         battle_id = getattr(battle, 'battle_tag', str(id(battle)))
         if battle_id not in self.battles_seen:
@@ -723,19 +753,16 @@ class CustomAgent(Player):
             for species, pokemon in battle.opponent_team.items():
                 self.opponent_tracker.team_preview_seen.add(species)
         
-        # ANTI-DEOXYS STRATEGY: They always lead Deoxys, so counter it
-        # Deoxys is frail and weak to Ghost/Dark moves
-        # Kingambit has Dark moves but gets walled by status moves
-        # Zacian and Arceus-Fairy are better vs Deoxys
-        
-        preferred_lead = "kingambit"  # Back to Kingambit, but with smarter move selection vs Deoxys
+        # ADAPTIVE LEAD STRATEGY: Back to Kingambit with improved move selection 
+        preferred_lead = "kingambit"
         
         # Find the preferred lead  
         team_list = list(battle.team.values())
         for i, pokemon in enumerate(team_list):
-            if pokemon.species == preferred_lead:  # Direct match since both are lowercase
+            if pokemon.species == preferred_lead:
                 return f"/team {i + 1}"
-        # Fallback to Kingambit if we can't find preferred lead
+        
+        # Fallback to Kingambit if Zacian not found
         for i, pokemon in enumerate(team_list):
             if pokemon.species == 'kingambit':
                 return f"/team {i + 1}"
@@ -748,8 +775,4 @@ class CustomAgent(Player):
     
     def team_preview(self, battle):
         """Another alternative method name"""
-        return self.teampreview(battle)
-    
-    def choose_default_move(self, battle):
-        """Last resort - choose team on battle start if teampreview failed"""
         return self.teampreview(battle)
