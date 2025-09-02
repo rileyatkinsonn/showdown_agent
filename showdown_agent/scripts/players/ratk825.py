@@ -104,8 +104,8 @@ class CustomAgent(Player):
 
         return score
 
-    def _should_dynamax(self, battle: AbstractBattle, n_remaining_mons: int):
-        if battle.can_dynamax:
+    def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
+        if battle.can_tera:
             # Last full HP mon
             if (
                 len([m for m in battle.team.values() if m.current_hp_fraction == 1])
@@ -225,7 +225,7 @@ class CustomAgent(Player):
                 * opponent.damage_multiplier(m),
             )
             return self.create_order(
-                move, dynamax=self._should_dynamax(battle, n_remaining_mons)
+                move, terastallize=self._should_tera(battle, n_remaining_mons)
             )
 
         if battle.available_switches:
