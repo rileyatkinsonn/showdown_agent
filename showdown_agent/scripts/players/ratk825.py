@@ -1,7 +1,7 @@
 from typing import List, Optional, Dict, Set
 from dataclasses import dataclass, field
 
-from poke_env.battle import MoveCategory
+from poke_env.battle import MoveCategory, Target
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.double_battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
@@ -157,7 +157,7 @@ class OpponentTracker:
     def add_pokemon(self, species: str, pokemon: Pokemon = None):
         """Add a new Pokemon to our knowledge"""
         if species not in self.known_pokemon:
-            types = [str(t) for t in pokemon.types] if pokemon and pokemon.types else []
+            types = [t.name.lower() for t in pokemon.types] if pokemon and pokemon.types else []
             self.known_pokemon[species] = OpponentPokemon(
                 species=species,
                 types=types,
@@ -184,7 +184,7 @@ class OpponentTracker:
             opp_mon.is_alive = not pokemon.fainted
             opp_mon.status = pokemon.status.name if pokemon.status else None
             if pokemon.types:
-                opp_mon.types = [str(t) for t in pokemon.types]
+                opp_mon.types = [t.name.lower() for t in pokemon.types]
 
             opp_mon.record_turn_active()
             self.last_active_pokemon = species
@@ -477,14 +477,13 @@ class CustomAgent(Player):
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
         special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
 
-        base_value = (
-                move.base_power
-                * (1.5 if move.type in active.types else 1)
-                * (physical_ratio if move.category == MoveCategory.PHYSICAL else special_ratio)
-                * move.accuracy
-                * move.expected_hits
-                * opponent.damage_multiplier(move)
-        )
+        acc = move.accuracy if move.accuracy is not None else 1.0
+        hits = getattr(move, "n_damaging_hits", 1)
+        bp = move.base_power or 0
+        stab = 1.5 if (move.type and move.type in active.types) else 1.0
+        base_value = bp * stab * (
+            physical_ratio if move.category == MoveCategory.PHYSICAL else special_ratio) * acc * hits * opponent.damage_multiplier(
+            move)
 
         return base_value
     
@@ -552,9 +551,9 @@ class CustomAgent(Player):
                 return {'sucker_punch': 0.7, 'setup_attack': 0.2, 'switch': 0.1}
             else:
                 return {'attacking_move': 0.6, 'sucker_punch': 0.3, 'switch': 0.1}
-        elif 'zacian' in species_lower:
+        elif 'zaciancrowned' in species_lower:
             return {'attacking_move': 0.7, 'setup_swords_dance': 0.2, 'switch': 0.1}
-        elif 'deoxys' in species_lower:
+        elif 'deoxysspeed' in species_lower:
             return {'status_move': 0.5, 'hazard_move': 0.3, 'switch': 0.2}
         else:
             return {'attacking_move': 0.6, 'setup_move': 0.2, 'switch': 0.2}
@@ -786,7 +785,7 @@ class CustomAgent(Player):
         species_lower = species.lower().replace('-', '')
         
         # Species-specific predictions based on common Uber strategies
-        if 'deoxys' in species_lower:
+        if 'deoxysspeed' in species_lower:
             return {
                 "hazard_move": 0.4,     # Deoxys often sets spikes/hazards
                 "status_move": 0.3,     # Thunder Wave, Taunt
@@ -799,13 +798,13 @@ class CustomAgent(Player):
                 "setup_move": 0.3,      # Swords Dance
                 "priority_move": 0.2    # Sucker Punch
             }
-        elif 'zacian' in species_lower:
+        elif 'zaciancrowned' in species_lower:
             return {
                 "attacking_move": 0.6,  # Behemoth Blade, Close Combat
                 "setup_move": 0.3,      # Swords Dance
                 "coverage_move": 0.1    # Wild Charge
             }
-        elif 'arceus' in species_lower:
+        elif 'arceusfairy' in species_lower:
             return {
                 "setup_move": 0.4,      # Calm Mind
                 "attacking_move": 0.3,  # Judgment
@@ -851,31 +850,26 @@ class CustomAgent(Player):
                 
             # Estimate how good this matchup would be for them
             # (Simplified - would need to reconstruct Pokemon object)
-            type_advantage = self._estimate_type_matchup(pokemon_data.types, our_active.types)
+            type_advantage = self._estimate_type_matchup(
+                pokemon_data.types,  # already ['steel', 'fairy', ...]
+                [t.name.lower() for t in our_active.types]  # <- normalize enums to strings
+            )
             
             if type_advantage > best_matchup_score:
                 best_matchup_score = type_advantage
                 best_counter = species
                 
         return best_counter
-    
+
     def _get_type_effectiveness(self, attack_type: str, defend_types: List[str]) -> float:
-        """Get type effectiveness using GenData"""
-        if not defend_types:
+        if not defend_types or not attack_type:
             return 1.0
-            
-        total_multiplier = 1.0
-        for defend_type in defend_types:
-            try:
-                # Use poke_env's type chart data
-                multiplier = self.gen_data.type_chart[attack_type.lower()].get(defend_type.lower(), 1.0)
-                total_multiplier *= multiplier
-            except (KeyError, AttributeError):
-                # Fallback if type not found
-                total_multiplier *= 1.0
-        
-        return total_multiplier
-    
+        row = self.gen_data.type_chart.get(attack_type.lower(), {})
+        mult = 1.0
+        for d in defend_types:
+            mult *= float(row.get(d.lower(), 1.0))
+        return mult
+
     def _estimate_type_matchup(self, attacker_types: List[str], defender_types: List[str]) -> float:
         """Estimate type matchup advantage using real type effectiveness"""
         if not attacker_types or not defender_types:
@@ -936,19 +930,19 @@ class CustomAgent(Player):
                 self._battles_tracked_for_leads.add(battle_id)
                 self.opponent_lead_history[opponent_clean] = self.opponent_lead_history.get(opponent_clean, 0) + 1
             
-            if active_clean in ['arceusfairy', 'arceus'] and opponent_clean in ['deoxysspeed', 'deoxys']:
+            if active_clean == 'arceusfairy' and opponent_clean == 'deoxysspeed':
                 # Don't let them get free spikes - switch to our Deoxys
                 available_switches = battle.available_switches
                 if available_switches:
-                    deoxys_switches = [p for p in available_switches if 'deoxys' in p.species.lower()]
+                    deoxys_switches = [p for p in available_switches if 'deoxysspeed' in p.species.lower()]
                     if deoxys_switches:
                         return self.create_order(deoxys_switches[0])
                         
-            elif active_clean in ['kingambit'] and opponent_clean in ['koraidon', 'zaciancrowned']:
+            elif active_clean == 'kingambit' and opponent_clean in {'koraidon', 'zaciancrowned'}:
                 # Don't lead Kingambit vs Close Combat users
                 available_switches = battle.available_switches  
                 if available_switches:
-                    safe_switches = [p for p in available_switches if p.species.lower().replace('-', '') in ['arceusfairy', 'arceus', 'eternatus']]
+                    safe_switches = [p for p in available_switches if p.species.lower().replace('-', '') in ['arceusfairy', 'eternatus']]
                     if safe_switches:
                         return self.create_order(safe_switches[0])
 
@@ -1024,7 +1018,7 @@ class CustomAgent(Player):
                     move for move in battle.available_moves
                     if (move.boosts
                         and sum(move.boosts.values()) >= 2
-                        and move.target == "self"
+                        and move.target == Target.SELF
                         and min([active.boosts[s] for s, v in move.boosts.items() if v > 0]) < 6)
                 ]
 
@@ -1067,10 +1061,10 @@ class CustomAgent(Player):
                 base_score = self._estimate_matchup(switch, opponent)
 
                 # CRITICAL: Avoid switching into obvious bad matchups
-                if switch.species.lower() in ['zacian', 'zaciancrowned'] and opponent.species.lower() in ['zacian', 'zaciancrowned']:
+                if switch.species.lower() in 'zaciancrowned' and opponent.species.lower() in 'zaciancrowned':
                     base_score -= 1.0  # Heavy penalty for Zacian vs Zacian
                     
-                if switch.species.lower() in ['kingambit'] and opponent.species.lower() in ['zacian', 'zaciancrowned', 'koraidon']:
+                if switch.species.lower() in ['kingambit'] and opponent.species.lower() in ['zaciancrowned', 'koraidon']:
                     base_score -= 0.8  # Kingambit gets destroyed by Close Combat
                     
                 # Prefer switches that resist opponent's likely moves
