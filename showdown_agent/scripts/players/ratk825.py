@@ -309,6 +309,9 @@ class CustomAgent(Player):
         self.predictions_correct = 0
         self._last_opponent_species = None
         self._predicted_switch_last_turn = False
+        self.battle_count = 0  # Track number of battles for lead selection
+        self.battles_seen = set()  # Track which battles we've seen
+        self.opponent_lead_history = {}  # Track opponent's lead patterns
 
         # Constants for decision-making
         self.ENTRY_HAZARDS = {
@@ -917,6 +920,37 @@ class CustomAgent(Player):
                         
             self._last_opponent_species = opponent.species
             self._predicted_switch_last_turn = False  # Reset for this turn
+            
+        # CRITICAL FIX: Better lead selection and early game strategy  
+        if self.turn_count == 1:
+            # Learn their lead patterns for future battles
+            active_clean = active.species.lower().replace('-', '')
+            opponent_clean = opponent.species.lower().replace('-', '')
+            battle_id = getattr(battle, 'battle_tag', str(id(battle)))
+            
+            # Track opponent's lead (only once per battle)
+            if not hasattr(self, '_battles_tracked_for_leads'):
+                self._battles_tracked_for_leads = set()
+            
+            if battle_id not in self._battles_tracked_for_leads:
+                self._battles_tracked_for_leads.add(battle_id)
+                self.opponent_lead_history[opponent_clean] = self.opponent_lead_history.get(opponent_clean, 0) + 1
+            
+            if active_clean in ['arceusfairy', 'arceus'] and opponent_clean in ['deoxysspeed', 'deoxys']:
+                # Don't let them get free spikes - switch to our Deoxys
+                available_switches = battle.available_switches
+                if available_switches:
+                    deoxys_switches = [p for p in available_switches if 'deoxys' in p.species.lower()]
+                    if deoxys_switches:
+                        return self.create_order(deoxys_switches[0])
+                        
+            elif active_clean in ['kingambit'] and opponent_clean in ['koraidon', 'zaciancrowned']:
+                # Don't lead Kingambit vs Close Combat users
+                available_switches = battle.available_switches  
+                if available_switches:
+                    safe_switches = [p for p in available_switches if p.species.lower().replace('-', '') in ['arceusfairy', 'arceus', 'eternatus']]
+                    if safe_switches:
+                        return self.create_order(safe_switches[0])
 
         if battle.available_moves and (
                 not self._should_switch_out(battle) or not battle.available_switches
@@ -1001,11 +1035,25 @@ class CustomAgent(Player):
                     elif current_matchup > 1.0:  # Only if we have a really good matchup
                         return self.create_order(setup_moves[0])
 
-            # Use minimax evaluation with learned opponent data
-            best_move = max(
-                battle.available_moves,
-                key=lambda m: self._minimax_evaluate_move(m, active, opponent, battle, depth=1)
-            )
+            # Use minimax evaluation with accuracy considerations
+            move_values = {}
+            for move in battle.available_moves:
+                base_value = self._minimax_evaluate_move(move, active, opponent, battle, depth=1)
+                
+                # CRITICAL FIX: Account for accuracy issues
+                if move.id == 'fireblast' and move.accuracy < 1.0:
+                    # Fire Blast keeps missing - heavily penalize unless it's a KO
+                    predicted_damage = move.base_power * opponent.damage_multiplier(move)
+                    if predicted_damage < opponent.current_hp * 0.9:  # Not a likely KO
+                        base_value *= 0.3  # Heavy penalty for inaccurate moves that don't KO
+                        
+                # Bonus for guaranteed accuracy moves in critical situations
+                if move.accuracy == 1.0 and active.current_hp_fraction < 0.3:
+                    base_value *= 1.2
+                    
+                move_values[move] = base_value
+                
+            best_move = max(move_values.keys(), key=lambda m: move_values[m])
 
             should_tera = self._should_tera(battle, n_remaining_mons)
             return self.create_order(best_move, terastallize=should_tera)
@@ -1013,10 +1061,25 @@ class CustomAgent(Player):
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
 
-            # Enhanced switch selection
+            # Enhanced switching logic with battle-specific improvements
             switch_scores = {}
             for switch in switches:
                 base_score = self._estimate_matchup(switch, opponent)
+
+                # CRITICAL: Avoid switching into obvious bad matchups
+                if switch.species.lower() in ['zacian', 'zaciancrowned'] and opponent.species.lower() in ['zacian', 'zaciancrowned']:
+                    base_score -= 1.0  # Heavy penalty for Zacian vs Zacian
+                    
+                if switch.species.lower() in ['kingambit'] and opponent.species.lower() in ['zacian', 'zaciancrowned', 'koraidon']:
+                    base_score -= 0.8  # Kingambit gets destroyed by Close Combat
+                    
+                # Prefer switches that resist opponent's likely moves
+                opponent_responses = self._predict_opponent_response(None, active, opponent, battle)
+                for response, prob in opponent_responses.items():
+                    if 'close_combat' in response and 'fairy' in str(switch.types).lower():
+                        base_score += prob * 0.5  # Fairy resists Fighting
+                    elif 'behemoth_blade' in response and switch.species.lower() in ['eternatus']:
+                        base_score += prob * 0.3  # Eternatus can live Behemoth Blade
 
                 # Bonus for unexpected switches against predictable opponents
                 if self.opponent_tracker.profile.risk_tolerance < 0.4:
@@ -1028,6 +1091,87 @@ class CustomAgent(Player):
             return self.create_order(best_switch)
 
         return self.choose_random_move(battle)
+    
+    def _get_optimal_lead(self, opponent_name: str = None) -> str:
+        """Determine optimal lead based on opponent patterns and learning data"""
+        
+        # If we know opponent's lead patterns, counter them
+        if self.opponent_lead_history:
+            most_common_opponent_lead = max(self.opponent_lead_history.keys(), 
+                                           key=lambda k: self.opponent_lead_history[k])
+            
+            # Counter their most common lead
+            lead_counters = {
+                'deoxysspeed': 'deoxysspeed',  # Speed tie for spikes
+                'koraidon': 'arceusfairy',     # Resists Close Combat
+                'zaciancrowned': 'eternatus',  # Can live Behemoth Blade
+                'kingambit': 'koraidon',       # Close Combat beats Kingambit
+                'arceusfairy': 'kingambit',    # Dark beats Fairy
+                'eternatus': 'kingambit',      # Can Sucker Punch
+            }
+            
+            if most_common_opponent_lead in lead_counters:
+                return lead_counters[most_common_opponent_lead]
+        
+        # Default leads based on battle count (adaptive strategy)
+        battle_mod = self.battle_count % 6
+        
+        if battle_mod == 0:
+            return 'kingambit'      # Aggressive lead with Sucker Punch
+        elif battle_mod == 1:
+            return 'deoxysspeed'    # Speed control and spikes
+        elif battle_mod == 2:
+            return 'zaciancrowned'  # Pure offense
+        elif battle_mod == 3:
+            return 'arceusfairy'    # Defensive pivot
+        elif battle_mod == 4:
+            return 'eternatus'      # Special attacker
+        else:
+            return 'koraidon'       # Physical powerhouse
+    
+    def teampreview(self, battle):
+        """Enhanced team preview with learned opponent data"""
+        # Only increment battle count once per unique battle
+        battle_id = getattr(battle, 'battle_tag', str(id(battle)))
+        if battle_id not in self.battles_seen:
+            self.battle_count += 1
+            self.battles_seen.add(battle_id)
+        
+        # Learn opponent team composition
+        if hasattr(battle, 'opponent_team') and battle.opponent_team:
+            for species, pokemon in battle.opponent_team.items():
+                self.opponent_tracker.team_preview_seen.add(species)
+                self.opponent_tracker.add_pokemon(species, pokemon)
+        
+        # Get opponent name for personalized strategy
+        opponent_name = getattr(battle, 'opponent_username', None)
+        
+        # Determine optimal lead
+        preferred_lead = self._get_optimal_lead(opponent_name)
+        
+        # Find the preferred lead in our team
+        team_list = list(battle.team.values())
+        for i, pokemon in enumerate(team_list):
+            species_clean = pokemon.species.lower().replace('-', '')
+            if species_clean == preferred_lead or pokemon.species == preferred_lead:
+                return f"/team {i + 1}"
+        
+        # Fallback: Try to find any of our good leads
+        fallback_leads = ['kingambit', 'deoxysspeed', 'zaciancrowned']
+        for lead in fallback_leads:
+            for i, pokemon in enumerate(team_list):
+                if pokemon.species.lower().replace('-', '') == lead or pokemon.species == lead:
+                    return f"/team {i + 1}"
+        
+        return "/team 1"
+    
+    def choose_team_preview(self, battle):
+        """Alternative method name that poke-env might use"""
+        return self.teampreview(battle)
+    
+    def team_preview(self, battle):
+        """Another alternative method name"""
+        return self.teampreview(battle)
     
     def _on_battle_end(self, battle: AbstractBattle):
         """Track performance and learning outcomes"""
