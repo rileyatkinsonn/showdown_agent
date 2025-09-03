@@ -157,12 +157,26 @@ class CustomAgent(Player):
         return False
 
     def _stat_estimation(self, mon: Pokemon, stat: str):
-        # Stats boosts value
-        if mon.boosts[stat] > 1:
-            boost = (2 + mon.boosts[stat]) / 2
+        gen_data = GenData.from_gen(9)
+        
+        # Get the Pokemon's species identifier, normalizing the name
+        species_id = mon.species.lower().replace(' ', '').replace('-', '')
+        
+        # Get base stats from GenData pokedex
+        if species_id in gen_data.pokedex:
+            base_stat = gen_data.pokedex[species_id]['baseStats'][stat]
         else:
-            boost = 2 / (2 - mon.boosts[stat])
-        return ((2 * mon.base_stats[stat] + 31) + 5) * boost
+            # Fallback to Pokemon object's base_stats if GenData lookup fails
+            base_stat = mon.base_stats[stat]
+        
+        # Estimate actual stat assuming level 50, neutral nature, 31 IVs, and moderate EVs (85)
+        # Formula: ((2 * base + IV + EV/4) * level / 100) + 5
+        estimated_stat = int((2 * base_stat + 31 + 85 // 4) * 50 / 100) + 5
+        
+        # Apply boosts from battle conditions
+        boost_multiplier = max(0.25, 1 + (mon.boosts.get(stat, 0) * 0.5))
+        
+        return estimated_stat * boost_multiplier
 
     def choose_move(self, battle: AbstractBattle):
         active = battle.active_pokemon
@@ -198,7 +212,7 @@ class CustomAgent(Player):
                     return self.create_order(move)
 
             # Setup moves
-            if ( active.current_hp_fraction == 1 and self._estimate_matchup(active, opponent) > 0):
+            if active.current_hp_fraction == 1 and self._estimate_matchup(active, opponent) > 0:
                 for move in battle.available_moves:
                     if (
                         move.boosts
