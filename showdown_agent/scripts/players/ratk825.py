@@ -414,17 +414,43 @@ class PokeEnvAdapter:
     def _move_value(self, move, me: Optional[Pokemon], opp: Optional[Pokemon]) -> float:
         if not (me and opp and move):
             return 0.0
-        # coarse value: base power * STAB * type mult * acc * (off/def ratios coarse)
+        # Immunities first
+        mult = opp.damage_multiplier(move)  # 0, 0.25, 0.5, 1, 2, 4
+        if mult <= 0:
+            return -1e3  # hard avoid
+
         bp = move.base_power or 0
         acc = move.accuracy if move.accuracy is not None else 1.0
         stab = 1.5 if (move.type and move.type in me.types) else 1.0
-        mult = opp.damage_multiplier(move)
-        # favor priority a bit
         prio = getattr(move, "priority", 0) or 0
-        pr_bonus = 0.05 * prio
-        # penalize recoil / misses slightly
-        miss_pen = (1.0 - acc) * 0.2
-        return bp * stab * mult * acc * (1.0 + pr_bonus) * (1.0 - miss_pen)
+
+        # Rough “effective power”
+        eff = bp * stab * mult * acc
+
+        # KO urge: if effective power is big relative to opp HP%, boost
+        opp_hp = max(0.05, getattr(opp, "current_hp_fraction", 1.0))
+        killshot = 1.0 if eff >= 120 * opp_hp else 0.0  # very rough threshold
+        # Utility bonuses: status/hazards/taunt
+        util = 0.0
+        mid = self._norm(getattr(move, "id", ""))
+        if mid in {"taunt"}:
+            util += 40.0
+        if mid in {"spikes"}:
+            util += 25.0
+        if mid in {"thunderwave"}:
+            util += 35.0 if self._norm(getattr(self.battle.opponent_active_pokemon, "species", "")) in {"zaciancrowned",
+                                                                                                        "zacian"} else 20.0
+
+        # Priority small bump
+        pr_bonus = 8.0 * prio
+
+        # Gentle recoil/miss penalty
+        miss_pen = (1.0 - acc) * 20.0
+
+        return eff + 60.0 * killshot + util + pr_bonus - miss_pen
+
+    def _norm(self, x):
+        return (x or "").lower().replace("-", "").replace(" ", "")
 
 
 class RolloutEnv:
@@ -597,10 +623,19 @@ class RolloutEnv:
             # choose a heuristic action for *us* during rollout
             a = self._heuristic_action()
             self.step(a)
-        # reward: KO diff + chip + small hazard credit
+        # reward: KO diff + chip + hazards + status + avoid dumb tera into fairy
         chip = (10 - self.s.opp_hp_bin) - (10 - self.s.me_hp_bin)
-        hazard = 0.2 * (self.s.opp_side_conds.get("stealthrock", 0) - self.s.side_conds.get("stealthrock", 0))
-        return 2.0 * (self.s.my_kos - self.s.opp_kos) + 0.3 * chip + hazard
+        hazard = 0.25 * (self.s.opp_side_conds.get("stealthrock", 0) - self.s.side_conds.get("stealthrock", 0))
+
+        # tiny status proxy: if we used setup or added hazards, small plus
+        setup_bonus = 0.1 * self.s.me_boosts.get("spa", 0)
+
+        # discourage tera when opp is fairy & we are dragon/fighting archetype (very coarse proxy)
+        bad_tera_pen = 0.0
+        if self.s.me_tera_used and ("fairy" in self.opp_types):
+            bad_tera_pen -= 0.5
+
+        return 2.0 * (self.s.my_kos - self.s.opp_kos) + 0.35 * chip + hazard + setup_bonus + bad_tera_pen
 
     def _heuristic_action(self) -> Action:
         # very small ladder: if we can likely KO soon -> attack; if we're low -> switch; else setup early
@@ -699,18 +734,38 @@ def _root_prior(adapter: PokeEnvAdapter, a: Action) -> float:
     opp = adapter.battle.opponent_active_pokemon
     if not (me and opp): return 0.0
     kind, payload = a
+    
     # SWITCH: prioritize good type matchup
     if kind == "switch":
         return 0.8 * adapter._estimate_matchup(payload, opp)
+    
     # MOVE or TERA_MOVE
     mv = payload
     dmg = _rough_damage(adapter, mv, me, opp)
-    # Simple KO check proxy: dmg compared to a scaled HP bucket
-    ko_bias = 0.7 if dmg >= 0.9 * 100 else 0.0  # coarse; you can replace with better HP scaling
+    
+    # CRITICAL: Spikes priority on Turn 1 with Deoxys
+    if (hasattr(mv, 'id') and mv.id == 'spikes' and 
+        adapter.battle.turn == 1 and 
+        "deoxys" in getattr(me, "species", "").lower()):
+        return 5.0  # Highest priority
+    
+    # Thunder Wave on fast threats
+    if (hasattr(mv, 'id') and mv.id == 'thunderwave' and 
+        "deoxys" in getattr(opp, "species", "").lower()):
+        return 3.0
+    
+    # Simple KO check proxy
+    ko_bias = 0.7 if dmg >= 0.9 * 100 else 0.0
+    
     # Death check: if opponent obviously KOs us next turn (Zacian vs Gambit)
     death_bias = 0.0
     if "zaciancrowned" in getattr(opp, "species", "") and "kingambit" in getattr(me, "species", ""):
-        death_bias = -1.0
+        death_bias = -2.0
+        
+    # Don't Tera early unless critical
+    if kind == "tera_move" and adapter.battle.turn <= 3:
+        death_bias -= 1.0
+    
     # Favor accurate moves in tight spots
     acc_bonus = 0.1 if (mv.accuracy or 1.0) >= 0.95 else 0.0
     return dmg / 100.0 + ko_bias + acc_bonus + death_bias
@@ -725,10 +780,84 @@ class CustomAgent(Player):
         self._uct_c = kwargs.pop("ismcts_c", 1.1)
         self.gendata = GenData.from_gen(9)
 
+    def _norm(self, x):
+        return (x or "").lower().replace("-", "").replace(" ", "")
+
+    def _find_move(self, battle, move_id: str):
+        for m in (battle.available_moves or []):
+            if self._norm(getattr(m, "id", "")) == self._norm(move_id):
+                return m
+        return None
+
+    def _choose_by_id(self, battle, move_id: str, terastallize: bool = False):
+        m = self._find_move(battle, move_id)
+        if m:
+            return self.create_order(m, terastallize=terastallize)
+        return None
+
+    def _fast_rules(self, battle: AbstractBattle):
+        """High-value guardrails. Return a BattleOrder or None."""
+        me = battle.active_pokemon
+        opp = battle.opponent_active_pokemon
+        me_s = self._norm(getattr(me, "species", None))
+        opp_s = self._norm(getattr(opp, "species", None))
+
+        # Never Tera Deoxys-S (it makes you weak to Sucker Punch & doesn't help vs Zacian)
+        # If Deoxys vs Deoxys, Taunt > Spikes (deny their layers first).
+        if me_s == "deoxysspeed":
+            if opp_s == "deoxysspeed":
+                return self._choose_by_id(battle, "taunt") or None
+            # If Zacian is in, TWave first; Psycho Boost later.
+            if opp_s in {"zaciancrowned", "zacian"}:
+                return self._choose_by_id(battle, "thunderwave") or None
+            # If Kingambit is in, DO NOT tera; set Spikes or Taunt depending on board.
+            if opp_s == "kingambit":
+                # If they could SD, Taunt; else Spikes
+                return self._choose_by_id(battle, "taunt") or self._choose_by_id(battle, "spikes")
+
+        # Eternatus: never click Dynamax Cannon into Fairies (Zacian, Arceus-Fairy).
+        if me_s == "eternatus" and opp_s in {"zaciancrowned", "zacian", "arceusfairy"}:
+            # Prefer Fire Blast; Meteor Beam if you need to push damage and have Herb.
+            return (self._choose_by_id(battle, "fireblast")
+                    or self._choose_by_id(battle, "meteorbeam"))
+
+        # Koraidon into Arceus-Fairy is losing—do NOT Tera Fire and swing into it; switch or chip smartly.
+        if me_s == "koraidon" and opp_s == "arceusfairy":
+            # Prefer switching to Arceus-Fairy or Eternatus; Deo-S sash is acceptable emergency pivot.
+            for target in (pokemon for pokemon in (battle.available_switches or [])):
+                t = self._norm(target.species)
+                if t in {"arceusfairy", "eternatus", "deoxysspeed"}:
+                    return self.create_order(target)
+            # If forced to attack, Flame Charge to scout & speed, not Tera CC.
+            fb = self._choose_by_id(battle, "flamecharge")
+            if fb:
+                return fb
+
+        # Kingambit vs Koraidon: don't Tera Dark and trade; pivot out.
+        if me_s == "kingambit" and opp_s == "koraidon":
+            for target in (battle.available_switches or []):
+                if self._norm(target.species) in {"arceusfairy", "deoxysspeed"}:
+                    return self.create_order(target)
+            # If trapped, Iron Head chip (don’t SD).
+            return self._choose_by_id(battle, "ironhead") or None
+
+        # Zacian mirrors: prefer Close Combat vs opposing Gambit; Behemoth vs most others.
+        if me_s in {"zaciancrowned", "zacian"}:
+            if opp_s == "kingambit":
+                return self._choose_by_id(battle, "closecombat") or None
+            if opp_s in {"deoxysspeed", "eternatus", "zaciancrowned", "zacian"}:
+                return self._choose_by_id(battle, "behemothblade") or None
+
+        return None
+
     def choose_move(self, battle: AbstractBattle):
         # Fallback if no actions
         if not (battle.available_moves or battle.available_switches):
             return self.choose_random_move(battle)
+
+        rule = self._fast_rules(battle)
+        if rule is not None:
+            return rule
 
         info = make_infoset(battle)
         adapter = PokeEnvAdapter(self, battle, self.gendata, heuristics_fn=None, iters_time_budget_s=self._time_s)
@@ -741,3 +870,43 @@ class CustomAgent(Player):
             time_budget_s=self._time_s,
         )
         return adapter.to_battle_order(result.best_action)
+
+# --- helpers for species normalization ---
+@staticmethod
+def _norm_species(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    return name.lower().replace("-", "").replace(" ", "")
+
+def _find_our(self, battle, wanted: List[str]) -> Optional[int]:
+    """Return 1-based slot of the first Pokémon in `wanted` that we actually have."""
+    team_list = list(battle.team.values())
+    for i, p in enumerate(team_list, start=1):
+        me = self._norm_species(p.species)
+        if me in wanted:
+            return i
+    return None
+
+# --- lead policy vs common Ubers teams (Deo-S / Zacian / Koraidon / Gambit / Arceus-F / Eternatus) ---
+def teampreview(self, battle):
+    # Try Deoxys-Speed first; else Zacian; else Arceus-Fairy; fallback to 1
+    order = ["deoxysspeed", "zaciancrowned", "arceusfairy", "koraidon", "eternatus", "kingambit"]
+    team_list = list(battle.team.values())
+    idx = 1
+    seen = {self._norm(p.species): i+1 for i,p in enumerate(team_list)}
+    for want in order:
+        if want in seen:
+            idx = seen[want]
+            break
+    print(f"Teampreview chose slot {idx} ({battle.team[idx-1].species})")
+    return f"/team {idx}"
+
+def choose_team_preview(self, battle): return self.teampreview(battle)
+def team_preview(self, battle): return self.teampreview(battle)
+
+# Poke-env sometimes calls alternate names; keep them wired up:
+def choose_team_preview(self, battle):
+    return self.teampreview(battle)
+
+def team_preview(self, battle):
+    return self.teampreview(battle)
