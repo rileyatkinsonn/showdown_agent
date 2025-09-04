@@ -1,14 +1,21 @@
-from typing import List, Optional, Dict, Set
-from dataclasses import dataclass, field
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Dict, Tuple, List, Optional, Hashable
+from collections import defaultdict
+import math
+import random
+import time
 
-from poke_env.battle import MoveCategory, Target
+# --- poke-env imports (runtime dependency) ---
+from poke_env.player.player import Player
+from poke_env.player.battle_order import BattleOrder
 from poke_env.battle.abstract_battle import AbstractBattle
-from poke_env.battle.double_battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
-from poke_env.player.battle_order import BattleOrder
-from poke_env.player.player import Player
-from poke_env.data import GenData
+from poke_env.battle.pokemon_type import PokemonType
+from poke_env.battle.move_category import MoveCategory
+from poke_env.data import GenData, to_id_str
+
 
 team = """
 Deoxys-Speed @ Focus Sash  
@@ -75,1106 +82,580 @@ Jolly Nature
 - Close Combat  
 """
 
+# ============================================================
+# 1) Lightweight types
+# ============================================================
 
-@dataclass
-class OpponentPokemon:
-    """Tracks what we know about an opponent's Pokemon"""
-    species: str
-    types: List[str] = field(default_factory=list)
-    moves_seen: Set[str] = field(default_factory=set)
-    ability: Optional[str] = None
-    item: Optional[str] = None
-    current_hp_fraction: float = 1.0
-    is_alive: bool = True
-    status: Optional[str] = None
-    switch_in_count: int = 0
-    turns_active: int = 0
-    damage_dealt: float = 0.0
-    damage_taken: float = 0.0
+Action = Tuple[str, Any]  # e.g., ("move", move_id), ("switch", ident), ("tera_move", move_id)
+Reward = float
 
-    def add_move(self, move_id: str):
-        self.moves_seen.add(move_id)
-
-    def update_hp(self, hp_fraction: float):
-        old_hp = self.current_hp_fraction
-        self.current_hp_fraction = hp_fraction
-        if hp_fraction <= 0:
-            self.is_alive = False
-        elif old_hp > hp_fraction:
-            self.damage_taken += old_hp - hp_fraction
-
-    def record_switch_in(self):
-        self.switch_in_count += 1
-
-    def record_turn_active(self):
-        self.turns_active += 1
+@dataclass(frozen=True)
+class InfosetKey:
+    key: Tuple[Hashable, ...]
 
 
 @dataclass
-class OpponentProfile:
-    """Tracks opponent's behavioral patterns"""
-    risk_tolerance: float = 0.5  # 0 = risk averse, 1 = risk loving
-    aggression_level: float = 0.5  # 0 = passive, 1 = aggressive
-    switching_frequency: float = 0.5  # How often they switch
-    setup_preference: float = 0.5  # How much they like setup moves
-    prediction_attempts: int = 0  # How many times they try to predict us
-    successful_predictions: int = 0
-    total_turns: int = 0
-    switches_made: int = 0
-    setup_moves_used: int = 0
-    risky_plays: int = 0
-
-    def update_switching(self, switched: bool):
-        self.total_turns += 1
-        if switched:
-            self.switches_made += 1
-        self.switching_frequency = self.switches_made / max(1, self.total_turns)
-
-    def update_risk_profile(self, was_risky: bool, paid_off: bool):
-        if was_risky:
-            self.risky_plays += 1
-            if paid_off:
-                self.risk_tolerance = min(1.0, self.risk_tolerance + 0.1)
-            else:
-                self.risk_tolerance = max(0.0, self.risk_tolerance - 0.05)
-
-    def record_setup_move(self):
-        self.setup_moves_used += 1
-        self.setup_preference = min(1.0, self.setup_moves_used / max(1, self.total_turns))
+class Infoset:
+    key: InfosetKey
+    obs: Dict[str, Any]  # observable snapshot (hp bins, hazards, weather, etc.)
 
 
-class OpponentTracker:
-    """Tracks opponent team and battle state"""
+@dataclass
+class ConcreteState:
+    # one determinization (hidden choices) + a compact abstract state we mutate in rollouts
+    hidden: Dict[str, Any]
+    obs: Dict[str, Any]
+    # abstract mutable fields for rollout
+    me_hp_bin: int
+    opp_hp_bin: int
+    me_boosts: Dict[str, int]
+    opp_boosts: Dict[str, int]
+    me_tera_used: bool
+    opp_tera_used: bool
+    side_conds: Dict[str, int]
+    opp_side_conds: Dict[str, int]
+    terminal: bool = False
+    # bookkeeping
+    my_kos: int = 0
+    opp_kos: int = 0
+    ply: int = 0
 
-    def __init__(self):
-        self.known_pokemon: Dict[str, OpponentPokemon] = {}
-        self.team_preview_seen: Set[str] = set()
-        self.active_pokemon_history: List[str] = []
-        self.profile = OpponentProfile()
-        self.turn_history: List[Dict] = []  # Track each turn's events
-        self.last_active_pokemon: Optional[str] = None
 
-    def add_pokemon(self, species: str, pokemon: Pokemon = None):
-        """Add a new Pokemon to our knowledge"""
-        if species not in self.known_pokemon:
-            types = [t.name.lower() for t in pokemon.types] if pokemon and pokemon.types else []
-            self.known_pokemon[species] = OpponentPokemon(
-                species=species,
-                types=types,
-                current_hp_fraction=pokemon.current_hp_fraction if pokemon else 1.0,
-                is_alive=not pokemon.fainted if pokemon else True,
-                status=pokemon.status.name if pokemon and pokemon.status else None
-            )
+@dataclass
+class SearchResult:
+    best_action: Action
+    action_stats: Dict[Action, Tuple[int, float]]  # visits, mean-Q
 
-    def update_pokemon(self, species: str, pokemon: Pokemon):
-        """Update known info about a Pokemon"""
-        if species not in self.known_pokemon:
-            self.add_pokemon(species, pokemon)
+
+# ============================================================
+# 2) Small helpers
+# ============================================================
+
+def bucket_hp(x: float) -> int:
+    # 0..10 bins
+    x = max(0.0, min(1.0, x))
+    return int(round(10 * x))
+
+def clamp_boost(v: int) -> int:
+    return max(-2, min(2, v))
+
+def type_mult(gendata: GenData, atk: Optional[str], defend_types: List[str]) -> float:
+    if not atk or not defend_types:
+        return 1.0
+    row = getattr(gendata, "type_chart", {}).get(to_id_str(atk), {})
+    mult = 1.0
+    for d in defend_types:
+        mult *= float(row.get(to_id_str(d), 1.0))
+    return mult
+
+# ============================================================
+# 3) Infoset extraction (observable only)
+# ============================================================
+
+def _freeze_for_key(x):
+    if isinstance(x, dict):
+        # sort keys for stability, and freeze values
+        return tuple((k, _freeze_for_key(v)) for k, v in sorted(x.items(), key=lambda kv: str(kv[0])))
+    if isinstance(x, list):
+        return tuple(_freeze_for_key(v) for v in x)
+    if isinstance(x, tuple):
+        return tuple(_freeze_for_key(v) for v in x)
+    # enums or objects: fall back to their string id if needed
+    try:
+        hash(x)
+        return x
+    except TypeError:
+        return str(x)
+
+def make_infoset(battle: AbstractBattle) -> Infoset:
+    me = battle.active_pokemon
+    opp = battle.opponent_active_pokemon
+
+    def boost_tuple(mon: Optional[Pokemon]):
+        if not mon:
+            return ()
+        return tuple(sorted((k, clamp_boost(v)) for k, v in mon.boosts.items()))
+
+    obs: Dict[str, Any] = {
+        "turn": battle.turn,
+        "me_active": getattr(me, "species", None),
+        "opp_active": getattr(opp, "species", None),
+        "me_types": [t.name.lower() for t in (me.types if me else []) if t],
+        "opp_types": [t.name.lower() for t in (opp.types if opp else []) if t],
+        "me_hp_bin": bucket_hp(getattr(me, "current_hp_fraction", 1.0)) if me else 10,
+        "opp_hp_bin": bucket_hp(getattr(opp, "current_hp_fraction", 1.0)) if opp else 10,
+        "me_boosts": boost_tuple(me),
+        "opp_boosts": boost_tuple(opp),
+        "side_conds": tuple(sorted((to_id_str(str(k.name)), v) for k, v in battle.side_conditions.items())),
+        "opp_side_conds": tuple(sorted((to_id_str(str(k.name)), v) for k, v in battle.opponent_side_conditions.items())),
+        "weather": tuple(sorted((to_id_str(str(k.name)), v) for k, v in battle.weather.items())),
+        "fields": tuple(sorted((to_id_str(str(k.name)), v) for k, v in battle.fields.items())),
+        "me_tera_used": battle.used_tera,
+        "opp_tera_used": battle.opponent_used_tera,
+        "revealed_opp_moves": tuple(sorted(getattr(opp, "moves", {}).keys())) if opp else (),
+        "revealed_opp_item": getattr(opp, "item", None) if opp else None,
+        "revealed_opp_ability": to_id_str(getattr(opp, "ability", "")) if opp and getattr(opp, "ability", None) else None,
+    }
+    key = InfosetKey(_freeze_for_key(obs))
+    return Infoset(key=key, obs=obs)
+
+# ============================================================
+# 4) Determinization (simple expert-friendly priors)
+# ============================================================
+
+# You can flesh this out per species if you want; keep it small and expert-coded (no ML)
+SPECIES_PRIORS: Dict[str, Dict[str, Any]] = {
+    # "zaciancrowned": {"tera": ["flying", "steel"], "items": ["rustedsword"], "common_moves": ["behemothblade","closecombat","wildcharge","swordsdance"]},
+    # ...
+}
+
+def sample_determinization(info: Infoset, gendata: GenData) -> ConcreteState:
+    opp_species = (info.obs.get("opp_active") or "").lower().replace(" ", "").replace("-", "")
+    prior = SPECIES_PRIORS.get(opp_species, {})
+    revealed = set(info.obs["revealed_opp_moves"])
+    common = prior.get("common_moves", [])
+    fill = [m for m in common if m not in revealed]
+    random.shuffle(fill)
+    moveset = list(revealed) + fill[: max(0, 4 - len(revealed))]
+
+    item = info.obs["revealed_opp_item"] or random.choice(prior.get("items", ["leftovers", "boots", "sash"]))
+    tera = "none" if info.obs["opp_tera_used"] else random.choice(prior.get("tera", ["steel", "fire", "fairy"]))
+    ev_template = prior.get("ev", "offensive")  # "offensive"/"bulky"/"balanced"
+
+    # Build mutable abstract state for rollout
+    conc = ConcreteState(
+        hidden={"opp_moveset": tuple(moveset), "opp_item": item, "opp_tera": tera, "opp_ev": ev_template},
+        obs=info.obs,
+        me_hp_bin=info.obs["me_hp_bin"],
+        opp_hp_bin=info.obs["opp_hp_bin"],
+        me_boosts=dict(info.obs["me_boosts"]),
+        opp_boosts=dict(info.obs["opp_boosts"]),
+        me_tera_used=bool(info.obs["me_tera_used"]),
+        opp_tera_used=bool(info.obs["opp_tera_used"]),
+        side_conds={k: v for k, v in info.obs["side_conds"]},
+        opp_side_conds={k: v for k, v in info.obs["opp_side_conds"]},
+    )
+    return conc
+
+
+# ============================================================
+# 5) Node + UCT + progressive widening
+# ============================================================
+
+class Node:
+    __slots__ = ("key", "N", "Q", "N_a", "children", "untried")
+
+    def __init__(self, key: InfosetKey, legal_actions: List[Action]):
+        self.key = key
+        self.N = 0
+        self.Q: Dict[Action, float] = defaultdict(float)
+        self.N_a: Dict[Action, int] = defaultdict(int)
+        self.children: Dict[Action, Node] = {}
+        self.untried: List[Action] = list(legal_actions)
+
+    def ucb(self, a: Action, c: float = 1.2) -> float:
+        n = self.N_a[a]
+        if n == 0:
+            return float("inf")
+        return (self.Q[a] / n) + c * math.sqrt(max(1e-9, math.log(self.N) / n))
+
+    def record(self, a: Action, r: Reward):
+        self.N += 1
+        self.N_a[a] += 1
+        self.Q[a] += r
+
+
+def progressive_widening(node: Node, legal_actions: List[Action], k: float = 1.2, alpha: float = 0.6):
+    limit = int(k * (node.N ** alpha)) + 1
+    # keep untried limited (simple heuristic: keep initial order)
+    if len(node.children) + len(node.untried) > limit:
+        keep = max(0, limit - len(node.children))
+        node.untried = node.untried[:keep]
+
+# ============================================================
+# 6) Adapter: converts poke-env battle to abstract actions, & tiny rollout model
+# ============================================================
+
+class PokeEnvAdapter:
+    """
+    A very small 'environment adapter':
+    - At root, it reads legal actions from poke-env (moves/switches/tera+move).
+    - For ISMCTS/rollout, it holds a ConcreteState and applies abstract effects:
+        * We don't need pixel-accurate simulation; we update hp bins using heuristic scores.
+    """
+
+    def __init__(self, player: Player, battle: AbstractBattle, gendata: GenData, heuristics_fn=None, iters_time_budget_s: float = 1.2):
+        self.player = player
+        self.battle = battle
+        self.gendata = gendata
+        self.heuristics_fn = heuristics_fn  # optional: your external heuristic chooser
+        self.time_budget_s = iters_time_budget_s
+
+        # cache current legal actions at root
+        self.root_actions: List[Action] = self._extract_legal_actions(self.battle)
+
+    # -------- root API --------
+
+    def legal_actions(self) -> List[Action]:
+        return list(self.root_actions)
+
+    def to_battle_order(self, action: Action) -> BattleOrder:
+        kind, payload = action
+        if kind == "move":
+            return self.player.create_order(payload)  # payload is Move object
+        if kind == "switch":
+            return self.player.create_order(payload)  # payload is Pokemon object
+        if kind == "tera_move":
+            move = payload
+            return self.player.create_order(move, terastallize=True)
+        # fallback
+        return self.player.choose_random_move(self.battle)
+
+    def heuristic_best_action(self) -> Action:
+        # fallback when search does nothing
+        # pick the highest scoring move by a simple heuristic
+        best: Optional[Action] = None
+        best_v = -1e9
+        for a in self.root_actions:
+            v = self._root_action_score(a)
+            if v > best_v:
+                best, best_v = a, v
+        return best or self.root_actions[0]
+
+    def clone_with(self, conc: ConcreteState) -> "RolloutEnv":
+        # Build a rollout environment that owns the abstract mutable state
+        return RolloutEnv(conc, self.gendata)
+
+    def infoset_key(self) -> InfosetKey:
+        # (only used inside RolloutEnv; at root we already have it from make_infoset)
+        info = make_infoset(self.battle)
+        return info.key
+
+    # -------- helpers --------
+
+    def _extract_legal_actions(self, battle: AbstractBattle) -> List[Action]:
+        acts: List[Action] = []
+        # moves
+        for mv in (battle.available_moves or []):
+            if battle.can_tera and (not battle.used_tera):
+                # include tera+move as a distinct option (but you can gate with progressive widening)
+                acts.append(("tera_move", mv))
+            acts.append(("move", mv))
+        # switches
+        for sw in (battle.available_switches or []):
+            acts.append(("switch", sw))
+        # progressive widening will trim
+        return acts
+
+    def _root_action_score(self, a: Action) -> float:
+        # a quick score for initial ordering / fallback
+        kind, payload = a
+        me = self.battle.active_pokemon
+        opp = self.battle.opponent_active_pokemon
+        if kind == "switch":
+            if not opp or not payload:
+                return 0.0
+            return self._estimate_matchup(payload, opp)
         else:
-            opp_mon = self.known_pokemon[species]
+            mv = payload
+            return self._move_value(mv, me, opp)
 
-            # Check if this is a switch
-            if self.last_active_pokemon and self.last_active_pokemon != species:
-                opp_mon.record_switch_in()
-                self.profile.update_switching(True)
-            else:
-                self.profile.update_switching(False)
+    # --- simple reusable parts from your heuristics ---
 
-            opp_mon.update_hp(pokemon.current_hp_fraction)
-            opp_mon.is_alive = not pokemon.fainted
-            opp_mon.status = pokemon.status.name if pokemon.status else None
-            if pokemon.types:
-                opp_mon.types = [t.name.lower() for t in pokemon.types]
+    def _estimate_matchup(self, mon: Pokemon, opp: Pokemon) -> float:
+        # type edges (max multiplier of opponent hitting me minus me hitting opp)
+        my_def_types = [t for t in mon.types if t]
+        opp_def_types = [t for t in opp.types if t]
+        # rough: assume best STAB of each
+        my_best = 1.0
+        for t in my_def_types:
+            my_best = max(my_best, type_mult(self.gendata, t.name.lower(), [d.name.lower() for d in opp_def_types]))
+        opp_best = 1.0
+        for t in opp_def_types:
+            opp_best = max(opp_best, type_mult(self.gendata, t.name.lower(), [d.name.lower() for d in my_def_types]))
+        # hp consideration
+        hp_term = (getattr(mon, "current_hp_fraction", 1.0) - getattr(opp, "current_hp_fraction", 1.0))
+        return (my_best - opp_best) + 0.4 * hp_term
 
-            opp_mon.record_turn_active()
-            self.last_active_pokemon = species
+    def _move_value(self, move, me: Optional[Pokemon], opp: Optional[Pokemon]) -> float:
+        if not (me and opp and move):
+            return 0.0
+        # coarse value: base power * STAB * type mult * acc * (off/def ratios coarse)
+        bp = move.base_power or 0
+        acc = move.accuracy if move.accuracy is not None else 1.0
+        stab = 1.5 if (move.type and move.type in me.types) else 1.0
+        mult = opp.damage_multiplier(move)
+        # favor priority a bit
+        prio = getattr(move, "priority", 0) or 0
+        pr_bonus = 0.05 * prio
+        # penalize recoil / misses slightly
+        miss_pen = (1.0 - acc) * 0.2
+        return bp * stab * mult * acc * (1.0 + pr_bonus) * (1.0 - miss_pen)
 
-    def log_move_used(self, species: str, move_id: str, was_risky: bool = False, was_setup: bool = False):
-        """Record that we saw this Pokemon use this move"""
-        if species in self.known_pokemon:
-            self.known_pokemon[species].add_move(move_id)
 
-            if was_setup:
-                self.profile.record_setup_move()
+class RolloutEnv:
+    """
+    Rollout environment over a ConcreteState (abstract, not the live battle).
+    Stepping rule:
+      - On our turn, pick an action (passed by ISMCTS), apply abstract damage to opp_hp_bin.
+      - On opp turn, pick a simple opponent action (heuristic) and apply damage to me_hp_bin.
+      - Track KOs, basic hazard value, and end after 'cutoff' plies or KO.
+    """
+    def __init__(self, conc: ConcreteState, gendata: GenData, cutoff: int = 6):
+        self.s = conc
+        self.gendata = gendata
+        self.cutoff = cutoff
 
-            # Record turn event
-            turn_data = {
-                'pokemon': species,
-                'move': move_id,
-                'risky': was_risky,
-                'setup': was_setup
-            }
-            self.turn_history.append(turn_data)
+        # frozen info for heuristics
+        self.me_types = self.s.obs["me_types"]
+        self.opp_types = self.s.obs["opp_types"]
+        self.opp_moveset = list(self.s.hidden.get("opp_moveset", []))
 
-    def get_alive_count(self) -> int:
-        """Get number of opponent Pokemon still alive"""
-        return sum(1 for mon in self.known_pokemon.values() if mon.is_alive)
+    def terminal(self) -> bool:
+        return self.s.terminal or self.s.ply >= self.cutoff or self.s.me_hp_bin <= 0 or self.s.opp_hp_bin <= 0
 
-    def get_switch_pattern_score(self, current_species: str) -> float:
-        """Analyze opponent's switching patterns for this Pokemon"""
-        if current_species not in self.known_pokemon:
-            return 0.5
+    def legal_actions(self) -> List[Action]:
+        # abstract action menu: always allow {ATTACK, SETUP, HAZARD, SWITCH, TERA+ATTACK?}
+        # we proxy them as simple tuples; mapping back to BattleOrder happens only at root.
+        # For rollouts, we only need a few "modes" to evaluate consequences.
+        acts: List[Action] = [("A_ATTACK", None)]
+        # allow HAZARD early if opponent has >3 mons alive (approx via opp_hp_bin)
+        if self.s.opp_hp_bin > 3 and "stealthrock" in self.opp_moveset:  # optional gate
+            acts.append(("A_HAZARD", None))
+        acts.append(("A_SETUP", None))
+        acts.append(("A_SWITCH", None))
+        if not self.s.me_tera_used:
+            acts.append(("A_TERA_ATTACK", None))
+        return acts
 
-        mon = self.known_pokemon[current_species]
-        if mon.turns_active == 0:
-            return 0.5
+    def infoset_key(self) -> InfosetKey:
+        # Generate a key consistent with how root keys look (roughly)
+        obs_like = (
+            ("me_hp_bin", self.s.me_hp_bin),
+            ("opp_hp_bin", self.s.opp_hp_bin),
+            ("me_tera_used", self.s.me_tera_used),
+            ("opp_tera_used", self.s.opp_tera_used),
+            ("side_conds", tuple(sorted(self.s.side_conds.items()))),
+            ("opp_side_conds", tuple(sorted(self.s.opp_side_conds.items()))),
+        )
+        return InfosetKey(obs_like)
 
-        # Pokemon that switch in frequently are more likely to switch again
-        switch_tendency = mon.switch_in_count / max(1, mon.turns_active)
-        return min(1.0, switch_tendency * 2)
+    def step(self, action: Action):
+        if self.terminal():
+            return
+        # our ply
+        self._apply_our_action(action)
+        self.s.ply += 1
+        self._check_terminal()
+        if self.terminal():
+            return
+        # opponent ply
+        opp_action = self._opponent_policy()
+        self._apply_opp_action(opp_action)
+        self.s.ply += 1
+        self._check_terminal()
 
-    def predict_switch_likelihood(self, current_matchup_score: float, current_species: str) -> float:
-        """Enhanced switch prediction using opponent profiling"""
-        base_likelihood = 0.2
+    def _apply_our_action(self, action: Action):
+        k, _ = action
+        dmg = 0
+        if k in ("A_ATTACK", "A_TERA_ATTACK"):
+            base = 2.0  # abstract damage in hp bins; tune
+            stab_bonus = 0.5 if k == "A_TERA_ATTACK" else 0.3
+            type_bonus = self._best_type_mult(attacker="me", defender="opp")
+            dmg = int(round(base + stab_bonus + type_bonus))
+            self.s.opp_hp_bin = max(0, self.s.opp_hp_bin - dmg)
+            if k == "A_TERA_ATTACK":
+                self.s.me_tera_used = True
+        elif k == "A_HAZARD":
+            # add a little persistent pressure
+            self.s.opp_side_conds["stealthrock"] = self.s.opp_side_conds.get("stealthrock", 0) + 1
+        elif k == "A_SETUP":
+            self.s.me_boosts["spa"] = clamp_boost(self.s.me_boosts.get("spa", 0) + 1)
+        elif k == "A_SWITCH":
+            # mild defensive heal / reset risk
+            self.s.me_hp_bin = min(10, self.s.me_hp_bin + 1)
 
-        # Matchup-based prediction
-        if current_matchup_score < -2.0:
-            base_likelihood = 0.8
-        elif current_matchup_score < -1.0:
-            base_likelihood = 0.6
-        elif current_matchup_score > 1.5:
-            base_likelihood = 0.1
+    def _apply_opp_action(self, action_key: str):
+        dmg = 0
+        if action_key in ("ATTACK", "TERA_ATTACK"):
+            base = 2.0
+            stab_bonus = 0.5 if action_key == "TERA_ATTACK" else 0.3
+            type_bonus = self._best_type_mult(attacker="opp", defender="me")
+            dmg = int(round(base + stab_bonus + type_bonus))
+            self.s.me_hp_bin = max(0, self.s.me_hp_bin - dmg)
+            if action_key == "TERA_ATTACK":
+                self.s.opp_tera_used = True
+        elif action_key == "SETUP":
+            self.s.opp_boosts["spa"] = clamp_boost(self.s.opp_boosts.get("spa", 0) + 1)
+        elif action_key == "HAZARD":
+            self.s.side_conds["stealthrock"] = self.s.side_conds.get("stealthrock", 0) + 1
+        elif action_key == "SWITCH":
+            self.s.opp_hp_bin = min(10, self.s.opp_hp_bin + 1)
 
-        # Adjust based on opponent profile
-        profile_modifier = 0.0
+    def _best_type_mult(self, attacker: str, defender: str) -> float:
+        if attacker == "me":
+            atks = self.me_types
+            defs = self.opp_types
+        else:
+            atks = self.opp_types
+            defs = self.me_types
+        best = 0.0
+        for t in atks:
+            best = max(best, type_mult(self.gendata, t, defs))
+        # translate multiplier to small bin bonus
+        if best >= 2.0:
+            return 0.8
+        if best <= 0.5:
+            return -0.5
+        return 0.0
 
-        # Risk-averse players switch more in bad matchups
-        if self.profile.risk_tolerance < 0.3 and current_matchup_score < 0:
-            profile_modifier += 0.2
+    def _check_terminal(self):
+        if self.s.me_hp_bin <= 0:
+            self.s.terminal = True
+            self.s.opp_kos += 1
+        if self.s.opp_hp_bin <= 0:
+            self.s.terminal = True
+            self.s.my_kos += 1
 
-        # Aggressive players stay in more often
-        if self.profile.aggression_level > 0.7:
-            profile_modifier -= 0.15
+    def _opponent_policy(self) -> str:
+        # extremely small opponent policy; you can bias by revealed moves or your tracker
+        # prefer attack; sometimes setup; sometimes tera early if not used
+        r = random.random()
+        if not self.s.opp_tera_used and r < 0.1:
+            return "TERA_ATTACK"
+        if r < 0.7:
+            return "ATTACK"
+        if r < 0.85:
+            return "SETUP"
+        if r < 0.95:
+            return "SWITCH"
+        return "HAZARD"
 
-        # Factor in this Pokemon's switching history
-        switch_pattern = self.get_switch_pattern_score(current_species)
-        profile_modifier += (switch_pattern - 0.5) * 0.3
+    def rollout_evaluate(self, max_plies: int = 6) -> Reward:
+        while not self.terminal():
+            # choose a heuristic action for *us* during rollout
+            a = self._heuristic_action()
+            self.step(a)
+        # reward: KO diff + chip + small hazard credit
+        chip = (10 - self.s.opp_hp_bin) - (10 - self.s.me_hp_bin)
+        hazard = 0.2 * (self.s.opp_side_conds.get("stealthrock", 0) - self.s.side_conds.get("stealthrock", 0))
+        return 2.0 * (self.s.my_kos - self.s.opp_kos) + 0.3 * chip + hazard
 
-        # Factor in overall switching frequency
-        if self.profile.switching_frequency > 0.4:
-            profile_modifier += 0.1
+    def _heuristic_action(self) -> Action:
+        # very small ladder: if we can likely KO soon -> attack; if we're low -> switch; else setup early
+        if self.s.opp_hp_bin <= 2:
+            return ("A_ATTACK", None)
+        if self.s.me_hp_bin <= 2 and self.s.ply < 4:
+            return ("A_SWITCH", None)
+        if self.s.ply < 2 and self.s.me_boosts.get("spa", 0) < 2:
+            return ("A_SETUP", None)
+        return ("A_ATTACK", None)
 
-        final_likelihood = max(0.0, min(1.0, base_likelihood + profile_modifier))
-        return final_likelihood
 
-    def predict_move_choice(self, current_species: str, available_moves: List[str], our_pokemon: Pokemon) -> Dict[str, float]:
-        """Predict what move the opponent is likely to use"""
-        if current_species not in self.known_pokemon:
-            return {move: 1.0 / len(available_moves) for move in available_moves}
+# ============================================================
+# 7) ISMCTS main loop
+# ============================================================
 
-        mon = self.known_pokemon[current_species]
-        predictions = {}
+def ismcts_search(root_info: Infoset,
+                  env_adapter: PokeEnvAdapter,
+                  gendata: GenData,
+                  max_iters: int = 800,
+                  uct_c: float = 1.1,
+                  time_budget_s: Optional[float] = 1.2) -> SearchResult:
 
-        for move in available_moves:
-            score = 0.25  # Base probability
+    root_legal = env_adapter.legal_actions()
+    # progressive preordering by a simple root heuristic:
+    root_legal = sorted(root_legal, key=lambda a: -_root_prior(env_adapter, a))
+    root = Node(root_info.key, legal_actions=root_legal)
+    nodes: Dict[InfosetKey, Node] = {root_info.key: root}
 
-            # If we've seen this move before, they might use it again
-            if move in mon.moves_seen:
-                score += 0.3
+    start_t = time.time()
+    it = 0
+    while it < max_iters:
+        if time_budget_s is not None and (time.time() - start_t) >= time_budget_s:
+            break
+        it += 1
 
-            # Aggressive opponents prefer damaging moves
-            if self.profile.aggression_level > 0.6:
-                if 'attack' in move.lower() or 'punch' in move.lower() or 'blast' in move.lower():
-                    score += 0.2
+        conc = sample_determinization(root_info, gendata)
+        env = env_adapter.clone_with(conc)
 
-            # Setup-loving opponents prefer stat-boosting moves
-            if self.profile.setup_preference > 0.3:
-                if 'dance' in move.lower() or 'calm' in move.lower() or 'agility' in move.lower():
-                    score += 0.3
+        path: List[Tuple[Node, Action]] = []
+        node = root
 
-            predictions[move] = score
+        # Selection
+        while (not env.terminal()) and (not node.untried):
+            legal = env.legal_actions()
+            legal = [a for a in legal if (a in node.children) or (a in node.untried)]
+            if not legal:
+                break
+            a = max(legal, key=lambda x: node.ucb(x, c=uct_c))
+            path.append((node, a))
+            env.step(a)
+            info_next = env.infoset_key()
+            child = node.children.get(a)
+            if child is None:
+                child = Node(info_next, env.legal_actions())
+                node.children[a] = child
+                nodes[info_next] = child
+            node = child
+            progressive_widening(node, env.legal_actions())
 
-        # Normalize probabilities
-        total = sum(predictions.values())
-        return {move: prob / total for move, prob in predictions.items()}
+        # Expansion
+        if (not env.terminal()) and node.untried:
+            a = node.untried.pop(0)
+            path.append((node, a))
+            env.step(a)
+            info_next = env.infoset_key()
+            child = Node(info_next, env.legal_actions())
+            node.children[a] = child
+            node = child
+
+        # Rollout & backup
+        R = env.rollout_evaluate()
+        for n, a in path:
+            n.record(a, R)
+
+    # Choose by visit count (robust child)
+    if not root.children:
+        best = env_adapter.heuristic_best_action()
+        return SearchResult(best_action=best, action_stats={})
+    best = max(root.children, key=lambda a: root.N_a[a])
+    stats = {a: (root.N_a[a], (root.Q[a] / root.N_a[a]) if root.N_a[a] else 0.0) for a in root.children}
+    return SearchResult(best_action=best, action_stats=stats)
+
+
+def _root_prior(adapter: PokeEnvAdapter, a: Action) -> float:
+    # Prior for root ordering / progressive widening synergy
+    kind, payload = a
+    if kind == "switch":
+        # small bonus if switching into good type vs current opp
+        return 0.5 * adapter._estimate_matchup(payload, adapter.battle.opponent_active_pokemon)
+    else:
+        return adapter._move_value(payload, adapter.battle.active_pokemon, adapter.battle.opponent_active_pokemon)
+
 
 
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
-
-        # Battle state tracking
-        self.opponent_tracker = OpponentTracker()
-        self._last_switched_turn = -2
-        self._tera_used = False
-        self.gen_data = GenData.from_gen(9)  # Gen 9 type chart and data
-        self.turn_count = 0
-        self.our_last_move = None
-        self.opponent_last_move = None
-        
-        # Performance tracking
-        self.battles_won = 0
-        self.battles_total = 0
-        self.predictions_made = 0
-        self.predictions_correct = 0
-        self._last_opponent_species = None
-        self._predicted_switch_last_turn = False
-        self.battle_count = 0  # Track number of battles for lead selection
-        self.battles_seen = set()  # Track which battles we've seen
-        self.opponent_lead_history = {}  # Track opponent's lead patterns
-
-        # Constants for decision-making
-        self.ENTRY_HAZARDS = {
-            "spikes": SideCondition.SPIKES,
-            "stealthrock": SideCondition.STEALTH_ROCK,
-            "stickyweb": SideCondition.STICKY_WEB,
-            "toxicspikes": SideCondition.TOXIC_SPIKES,
-        }
-        self.ANTI_HAZARDS_MOVES = {"rapidspin", "defog"}
-        self.SETUP_MOVES = {"swordsdance", "nastyplot", "calmmind", "dragondance", "agility"}
-        self.SPEED_TIER_COEFICIENT = 0.1
-        self.HP_FRACTION_COEFICIENT = 0.4
-        self.SWITCH_OUT_MATCHUP_THRESHOLD = -1.5  # Made less conservative
-
-        # Game theory parameters
-        self.PREDICTION_CONFIDENCE_THRESHOLD = 0.7
-        self.RISK_REWARD_THRESHOLD = 1.2
-
-    def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
-        score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
-        score -= max(
-            [mon.damage_multiplier(t) for t in opponent.types if t is not None]
-        )
-        if mon.base_stats["spe"] > opponent.base_stats["spe"]:
-            score += self.SPEED_TIER_COEFICIENT
-        elif opponent.base_stats["spe"] > mon.base_stats["spe"]:
-            score -= self.SPEED_TIER_COEFICIENT
-
-        score += mon.current_hp_fraction * self.HP_FRACTION_COEFICIENT
-        score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
-
-        # Enhanced matchup evaluation with more factors
-
-        # Speed control bonus
-        speed_diff = mon.base_stats["spe"] - opponent.base_stats["spe"]
-        if speed_diff > 20:  # Significant speed advantage
-            score += 0.3
-        elif speed_diff < -20:  # Significant speed disadvantage
-            score -= 0.3
-
-        # Ability synergies (simplified)
-        if hasattr(mon, 'ability') and mon.ability:
-            ability_name = str(mon.ability).lower()
-            if 'intimidate' in ability_name and opponent.stats["atk"] > opponent.stats["spa"]:
-                score += 0.2
-            elif 'pressure' in ability_name:
-                score += 0.1
-
-        return score
-
-    def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
-        if not battle.can_tera:
-            return False
-
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        if not active or not opponent:
-            return False
-
-        current_matchup = self._estimate_matchup(active, opponent)
-
-        # Critical situations - always tera
-        if n_remaining_mons == 1:
-            return True
-
-        # Last full HP mon
-        full_hp_mons = [m for m in battle.team.values() if m.current_hp_fraction == 1]
-        if len(full_hp_mons) == 1 and active.current_hp_fraction == 1:
-            return True
-
-        # Enhanced tera logic with opponent profiling
-        if current_matchup > 0.5 and active.current_hp_fraction >= 0.8:
-            # Against aggressive opponents, tera early to secure advantage
-            if self.opponent_tracker.profile.aggression_level > 0.7:
-                return True
-
-            # Against setup-heavy opponents, tera to prevent their setup
-            if self.opponent_tracker.profile.setup_preference > 0.4:
-                return True
-
-            # Standard good matchup tera
-            if (
-                    active.current_hp_fraction == 1 and
-                    opponent.current_hp_fraction == 1
-            ):
-                return True
-
-        # Defensive tera when in trouble
-        if current_matchup < -1.0 and active.current_hp_fraction < 0.5:
-            # Check if tera would significantly improve our defensive matchup
-            # This is a simplification - would need more complex type analysis
-            if n_remaining_mons <= 2:
-                return True
-
-        return False
-
-    def _should_switch_out(self, battle: AbstractBattle):
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        # Update opponent tracking
-        if opponent:
-            self.opponent_tracker.update_pokemon(opponent.species, opponent)
-
-        # If there is a decent switch in...
-        good_switches = [
-            m for m in battle.available_switches
-            if self._estimate_matchup(m, opponent) > 0
-        ]
-
-        if good_switches:
-            current_matchup = self._estimate_matchup(active, opponent)
-
-            # Enhanced switching logic with game theory
-            switch_likelihood = self.opponent_tracker.predict_switch_likelihood(
-                -current_matchup,  # Negative because it's from their perspective
-                opponent.species
-            )
-
-            # Standard reasons to switch
-            if active.boosts["def"] <= -3 or active.boosts["spd"] <= -3:
-                return True
-            if (
-                    active.boosts["atk"] <= -3
-                    and active.stats["atk"] >= active.stats["spa"]
-            ):
-                return True
-            if (
-                    active.boosts["spa"] <= -3
-                    and active.stats["atk"] <= active.stats["spa"]
-            ):
-                return True
-
-            # Enhanced matchup-based switching
-            if current_matchup < self.SWITCH_OUT_MATCHUP_THRESHOLD:
-                # If opponent is likely to switch, we might want to stay to punish
-                if switch_likelihood > 0.6 and current_matchup > -2.5:
-                    return False  # Stay to catch their switch
-                return True
-
-            # Mind games: sometimes switch when they don't expect it
-            if (
-                    current_matchup > -0.5 and switch_likelihood < 0.3 and
-                    self.opponent_tracker.profile.risk_tolerance > 0.6 and
-                    len(good_switches) > 0
-            ):
-                # Occasional unexpected switch to throw off predictable opponents
-                return True
-
-        return False
-
-    def _stat_estimation(self, mon: Pokemon, stat: str):
-        # Stats boosts value
-        if mon.boosts[stat] > 1:
-            boost = (2 + mon.boosts[stat]) / 2
-        else:
-            boost = 2 / (2 - mon.boosts[stat])
-        return ((2 * mon.base_stats[stat] + 31) + 5) * boost
-
-    def _calculate_move_value(self, move, active: Pokemon, opponent: Pokemon, battle: AbstractBattle):
-        """Basic move evaluation - minimax will handle opponent predictions"""
-        physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(opponent, "def")
-        special_ratio = self._stat_estimation(active, "spa") / self._stat_estimation(opponent, "spd")
-
-        acc = move.accuracy if move.accuracy is not None else 1.0
-        hits = getattr(move, "n_damaging_hits", 1)
-        bp = move.base_power or 0
-        stab = 1.5 if (move.type and move.type in active.types) else 1.0
-        base_value = bp * stab * (
-            physical_ratio if move.category == MoveCategory.PHYSICAL else special_ratio) * acc * hits * opponent.damage_multiplier(
-            move)
-
-        return base_value
-    
-    def _predict_opponent_response(self, our_move, active: Pokemon, opponent: Pokemon, battle: AbstractBattle) -> Dict[str, float]:
-        """Predict opponent's most likely responses to our move using learned data"""
-        responses = {}
-        
-        # Get opponent's known moves and behavioral patterns
-        known_pokemon = self.opponent_tracker.known_pokemon.get(opponent.species)
-        if not known_pokemon:
-            # No data yet - use species defaults
-            return self._get_default_opponent_responses(opponent.species, our_move)
-        
-        # Predict based on learned move patterns
-        predicted_moves = self._predict_likely_moves(opponent.species, active)
-        
-        # Estimate opponent's best responses
-        total_probability = 0.0
-        
-        # 1. Switching likelihood
-        current_matchup = self._estimate_matchup(opponent, active)
-        switch_likelihood = self.opponent_tracker.predict_switch_likelihood(current_matchup, opponent.species)
-        
-        if switch_likelihood > 0.3:  # They might switch
-            # Find their best switch-in against us
-            best_switch = self._predict_best_switch_in(battle)
-            if best_switch:
-                responses[f"switch_to_{best_switch}"] = switch_likelihood
-                total_probability += switch_likelihood
-        
-        # 2. Stay and attack with likely moves
-        stay_probability = 1.0 - switch_likelihood
-        if stay_probability > 0:
-            for move_type, move_prob in predicted_moves.items():
-                adjusted_prob = move_prob * stay_probability
-                
-                # Adjust probability based on our move
-                if our_move:
-                    if 'setup' in move_type and our_move.base_power > opponent.current_hp * 0.6:
-                        # Less likely to setup if we can KO them
-                        adjusted_prob *= 0.3
-                    elif 'priority' in move_type and our_move.priority <= 0 and active.current_hp_fraction < 0.5:
-                        # More likely to use priority if we're low HP and moving first
-                        adjusted_prob *= 1.5
-                    elif 'attacking' in move_type and current_matchup < 0:
-                        # More likely to attack if they have advantage
-                        adjusted_prob *= 1.3
-                
-                responses[move_type] = adjusted_prob
-                total_probability += adjusted_prob
-        
-        # Normalize probabilities
-        if total_probability > 0:
-            responses = {resp: prob/total_probability for resp, prob in responses.items()}
-        
-        return responses
-    
-    def _get_default_opponent_responses(self, species: str, our_move) -> Dict[str, float]:
-        """Default responses when we have no learned data"""
-        species_lower = species.lower().replace('-', '')
-        
-        # Species-specific response patterns
-        if 'kingambit' in species_lower:
-            if our_move and our_move.base_power == 0:  # Non-attacking move
-                return {'sucker_punch': 0.7, 'setup_attack': 0.2, 'switch': 0.1}
-            else:
-                return {'attacking_move': 0.6, 'sucker_punch': 0.3, 'switch': 0.1}
-        elif 'zaciancrowned' in species_lower:
-            return {'attacking_move': 0.7, 'setup_swords_dance': 0.2, 'switch': 0.1}
-        elif 'deoxysspeed' in species_lower:
-            return {'status_move': 0.5, 'hazard_move': 0.3, 'switch': 0.2}
-        else:
-            return {'attacking_move': 0.6, 'setup_move': 0.2, 'switch': 0.2}
-    
-    def _minimax_evaluate_move(self, move, active: Pokemon, opponent: Pokemon, battle: AbstractBattle, depth: int = 1) -> float:
-        """Minimax-style move evaluation using learned opponent data"""
-        if depth <= 0:
-            return self._calculate_move_value(move, active, opponent, battle)
-        
-        # Our move value
-        our_move_value = self._calculate_move_value(move, active, opponent, battle)
-        
-        # Predict opponent responses
-        opponent_responses = self._predict_opponent_response(move, active, opponent, battle)
-        
-        # Calculate expected value considering opponent's best response
-        total_expected_value = 0.0
-        
-        for response, probability in opponent_responses.items():
-            # Estimate the outcome after opponent's response
-            response_penalty = 0.0
-            
-            if 'switch' in response:
-                # Opponent switches - our move hits current target, they bring in counter
-                switch_penalty = 0.2  # General switching penalty
-                if 'switch_to_' in response:
-                    switch_target = response.replace('switch_to_', '')
-                    if switch_target in self.opponent_tracker.known_pokemon:
-                        switch_types = self.opponent_tracker.known_pokemon[switch_target].types
-                        if switch_types:
-                            # Check if their switch-in resists our move
-                            effectiveness = self._get_type_effectiveness(move.type.name, switch_types)
-                            if effectiveness < 1.0:
-                                switch_penalty = 0.4  # They switched to a resist
-                response_penalty = switch_penalty
-                
-            elif 'sucker_punch' in response:
-                if move.base_power == 0:
-                    # They used Sucker Punch on our status move - it fails
-                    response_penalty = -0.3  # This is good for us
-                else:
-                    # They hit us with Sucker Punch
-                    response_penalty = 0.4
-                    
-            elif 'setup' in response:
-                # They used a setup move - bad for us long term
-                response_penalty = 0.5
-                
-            elif 'attacking' in response:
-                # They attacked - estimate damage ratio
-                if active.current_hp_fraction < 0.3:
-                    response_penalty = 0.6  # We might get KOed
-                else:
-                    response_penalty = 0.2  # Normal damage trade
-                    
-            elif 'status' in response or 'hazard' in response:
-                # Status/hazard moves - moderate penalty
-                response_penalty = 0.3
-            
-            # Weight the penalty by probability
-            total_expected_value += (our_move_value - response_penalty * our_move_value) * probability
-        
-        return total_expected_value
-
-    def _should_predict_switch(self, battle: AbstractBattle) -> Optional[str]:
-        """Passive prediction - just track data without making risky plays"""
-        opponent = battle.opponent_active_pokemon
-        if not opponent:
-            return None
-
-        # Only predict for data collection, don't act on it aggressively
-        current_matchup = self._estimate_matchup(battle.active_pokemon, opponent)
-        switch_likelihood = self.opponent_tracker.predict_switch_likelihood(
-            -current_matchup, opponent.species
-        )
-
-        # Just predict the most likely switch for learning purposes
-        if switch_likelihood > 0.5:
-            return self._predict_best_switch_in(battle)
-
-        return None
-    
-    def _parse_battle_events(self, battle: AbstractBattle):
-        """Enhanced battle event parsing with better move detection"""
-        opponent = battle.opponent_active_pokemon
-        if not opponent:
-            return
-            
-        # Enhanced move detection using multiple signals
-        if hasattr(battle, 'turn') and battle.turn > 1:
-            move_detected = False
-            was_risky = False
-            was_setup = False
-            
-            # Check HP changes
-            if battle.active_pokemon and hasattr(self, '_our_last_hp'):
-                our_current_hp = battle.active_pokemon.current_hp_fraction
-                hp_change = self._our_last_hp - our_current_hp
-                
-                if hp_change > 0.1:  # Significant damage taken
-                    self._infer_opponent_move_type(opponent.species, "strong_attack")
-                    move_detected = True
-                    was_risky = hp_change > 0.3  # Big damage = risky play
-                elif hp_change > 0.01:  # Minor damage
-                    self._infer_opponent_move_type(opponent.species, "weak_attack")
-                    move_detected = True
-                    
-            # Check status changes
-            if battle.active_pokemon:
-                current_status = battle.active_pokemon.status.name if battle.active_pokemon.status else None
-                last_status = getattr(self, '_our_last_status', None)
-                if current_status != last_status:
-                    if current_status:  # Status was inflicted
-                        self._infer_opponent_move_type(opponent.species, f"status_{current_status}")
-                        move_detected = True
-                        
-            # Check stat changes (boosts)
-            if battle.active_pokemon:
-                our_last_boosts = getattr(self, '_our_last_boosts', {})
-                for stat, boost in battle.active_pokemon.boosts.items():
-                    old_boost = our_last_boosts.get(stat, 0)
-                    if boost != old_boost:
-                        if boost < old_boost:  # Stat was lowered
-                            self._infer_opponent_move_type(opponent.species, f"stat_drop_{stat}")
-                            move_detected = True
-                            
-            # Check opponent stat changes (they might have used setup)
-            opp_last_boosts = getattr(self, '_opp_last_boosts', {})
-            for stat, boost in opponent.boosts.items():
-                old_boost = opp_last_boosts.get(stat, 0)
-                if boost > old_boost:  # Opponent boosted stats
-                    self._infer_opponent_move_type(opponent.species, f"setup_{stat}")
-                    move_detected = True
-                    was_setup = True
-                        
-            # If no clear move detected but opponent was active, assume neutral move
-            if not move_detected and self.turn_count > 1:
-                self._infer_opponent_move_type(opponent.species, "unknown_move")
-                
-        # Store current state for next turn
-        if battle.active_pokemon:
-            self._our_last_hp = battle.active_pokemon.current_hp_fraction
-            self._our_last_status = battle.active_pokemon.status.name if battle.active_pokemon.status else None
-            self._our_last_boosts = dict(battle.active_pokemon.boosts)
-        else:
-            self._our_last_hp = 1.0
-            self._our_last_status = None
-            self._our_last_boosts = {}
-            
-        if opponent:
-            self._opp_last_boosts = dict(opponent.boosts)
-        else:
-            self._opp_last_boosts = {}
-    
-    def _learn_from_team_preview(self, battle: AbstractBattle):
-        """Learn opponent's team composition during team preview/early battle"""
-        if hasattr(battle, 'opponent_team') and battle.opponent_team:
-            for species, pokemon in battle.opponent_team.items():
-                self.opponent_tracker.add_pokemon(species, pokemon)
-                self.opponent_tracker.team_preview_seen.add(species)
-                
-        # Also learn from any visible opponent Pokemon
-        if battle.opponent_active_pokemon:
-            species = battle.opponent_active_pokemon.species
-            if species not in self.opponent_tracker.known_pokemon:
-                self.opponent_tracker.add_pokemon(species, battle.opponent_active_pokemon)
-    
-    def _infer_opponent_move_type(self, species: str, move_type: str):
-        """Record inferred move usage with enhanced categorization"""
-        was_risky = False
-        was_setup = False
-        
-        if "strong_attack" in move_type or "weak_attack" in move_type:
-            was_risky = "strong" in move_type
-            self.opponent_tracker.log_move_used(species, move_type, was_risky=was_risky)
-            
-        elif "status" in move_type:
-            # Status moves are generally not risky but can be strategic
-            self.opponent_tracker.log_move_used(species, move_type, was_risky=False)
-            
-        elif "setup" in move_type:
-            # Setup moves indicate strategic play
-            was_setup = True
-            self.opponent_tracker.log_move_used(species, move_type, was_setup=was_setup)
-            
-        elif "stat_drop" in move_type:
-            # Stat dropping moves are aggressive
-            was_risky = True
-            self.opponent_tracker.log_move_used(species, move_type, was_risky=was_risky)
-            
-        else:
-            # Unknown/neutral moves
-            self.opponent_tracker.log_move_used(species, move_type)
-    
-    def _predict_likely_moves(self, opponent_species: str, our_active: Pokemon) -> Dict[str, float]:
-        """Predict what moves opponent is likely to use based on learned data and current situation"""
-        known_pokemon = self.opponent_tracker.known_pokemon.get(opponent_species)
-        
-        if not known_pokemon or not known_pokemon.moves_seen:
-            return self._get_default_move_predictions(opponent_species, our_active)
-        
-        # Analyze learned move patterns
-        move_predictions = {}
-        total_seen = len(known_pokemon.moves_seen)
-        
-        # Base predictions from observed moves
-        for move in known_pokemon.moves_seen:
-            base_prob = 1.0 / total_seen
-            
-            # Adjust based on move type and situation
-            if "setup" in move and our_active.current_hp_fraction > 0.8:
-                base_prob *= 1.3  # More likely to setup when we're healthy
-            elif "attack" in move and our_active.current_hp_fraction < 0.5:
-                base_prob *= 1.2  # More likely to attack when we're weak
-            elif "status" in move and "status" not in str(our_active.status):
-                base_prob *= 1.1  # More likely to status if we don't have one
-                
-            move_predictions[move] = base_prob
-            
-        # Normalize probabilities
-        total_prob = sum(move_predictions.values())
-        if total_prob > 0:
-            move_predictions = {move: prob/total_prob for move, prob in move_predictions.items()}
-            
-        return move_predictions
-    
-    def _get_default_move_predictions(self, species: str, our_active: Pokemon) -> Dict[str, float]:
-        """Default move predictions for unknown Pokemon based on species and situation"""
-        species_lower = species.lower().replace('-', '')
-        
-        # Species-specific predictions based on common Uber strategies
-        if 'deoxysspeed' in species_lower:
-            return {
-                "hazard_move": 0.4,     # Deoxys often sets spikes/hazards
-                "status_move": 0.3,     # Thunder Wave, Taunt
-                "attacking_move": 0.2,  # Psycho Boost
-                "switching": 0.1        # Sometimes switches after hazards
-            }
-        elif 'kingambit' in species_lower:
-            return {
-                "attacking_move": 0.5,  # Kowtow Cleave, Iron Head
-                "setup_move": 0.3,      # Swords Dance
-                "priority_move": 0.2    # Sucker Punch
-            }
-        elif 'zaciancrowned' in species_lower:
-            return {
-                "attacking_move": 0.6,  # Behemoth Blade, Close Combat
-                "setup_move": 0.3,      # Swords Dance
-                "coverage_move": 0.1    # Wild Charge
-            }
-        elif 'arceusfairy' in species_lower:
-            return {
-                "setup_move": 0.4,      # Calm Mind
-                "attacking_move": 0.3,  # Judgment
-                "support_move": 0.2,    # Recover, Taunt
-                "switching": 0.1
-            }
-        elif 'eternatus' in species_lower:
-            return {
-                "setup_move": 0.4,      # Agility
-                "attacking_move": 0.5,  # Meteor Beam, Dynamax Cannon
-                "coverage_move": 0.1    # Fire Blast
-            }
-        elif 'koraidon' in species_lower:
-            return {
-                "attacking_move": 0.5,  # Scale Shot, Close Combat
-                "setup_move": 0.3,      # Swords Dance
-                "utility_move": 0.2     # Flame Charge for speed
-            }
-        else:
-            # Generic Pokemon
-            return {
-                "attacking_move": 0.6,
-                "setup_move": 0.2,
-                "status_move": 0.1,
-                "switching": 0.1
-            }
-    
-    def _predict_best_switch_in(self, battle: AbstractBattle):
-        """Predict what Pokemon opponent will switch to"""
-        current_opponent = battle.opponent_active_pokemon
-        our_active = battle.active_pokemon
-        
-        if not current_opponent or not our_active:
-            return None
-            
-        best_counter = None
-        best_matchup_score = -999
-        
-        # Check all known opponent Pokemon
-        for species, pokemon_data in self.opponent_tracker.known_pokemon.items():
-            if not pokemon_data.is_alive or species == current_opponent.species:
-                continue  # Skip fainted or currently active Pokemon
-                
-            # Estimate how good this matchup would be for them
-            # (Simplified - would need to reconstruct Pokemon object)
-            type_advantage = self._estimate_type_matchup(
-                pokemon_data.types,  # already ['steel', 'fairy', ...]
-                [t.name.lower() for t in our_active.types]  # <- normalize enums to strings
-            )
-            
-            if type_advantage > best_matchup_score:
-                best_matchup_score = type_advantage
-                best_counter = species
-                
-        return best_counter
-
-    def _get_type_effectiveness(self, attack_type: str, defend_types: List[str]) -> float:
-        if not defend_types or not attack_type:
-            return 1.0
-        row = self.gen_data.type_chart.get(attack_type.lower(), {})
-        mult = 1.0
-        for d in defend_types:
-            mult *= float(row.get(d.lower(), 1.0))
-        return mult
-
-    def _estimate_type_matchup(self, attacker_types: List[str], defender_types: List[str]) -> float:
-        """Estimate type matchup advantage using real type effectiveness"""
-        if not attacker_types or not defender_types:
-            return 1.0
-            
-        best_effectiveness = 0.0
-        
-        for att_type in attacker_types:
-            effectiveness = self._get_type_effectiveness(att_type, defender_types)
-            if effectiveness > best_effectiveness:
-                best_effectiveness = effectiveness
-                
-        return best_effectiveness
+        self._iters = kwargs.pop("ismcts_iters", 600)
+        self._time_s = kwargs.pop("ismcts_time_s", 1.2)  # wall-clock budget per move
+        self._uct_c = kwargs.pop("ismcts_c", 1.1)
+        self.gendata = GenData.from_gen(9)
 
     def choose_move(self, battle: AbstractBattle):
-        self.turn_count += 1
-        active = battle.active_pokemon
-        opponent = battle.opponent_active_pokemon
-
-        if active is None or opponent is None:
+        # Fallback if no actions
+        if not (battle.available_moves or battle.available_switches):
             return self.choose_random_move(battle)
 
-        # ACTIVE LEARNING: Parse battle events and update tracking
-        self._parse_battle_events(battle)
-
-        # Update opponent tracking with current Pokemon data
-        if opponent:
-            self.opponent_tracker.update_pokemon(opponent.species, opponent)
-
-        # Learn from team preview if first turn
-        if self.turn_count == 1:
-            self._learn_from_team_preview(battle)
-            
-        # Validate our predictions from last turn and update learning
-        if self.turn_count > 1 and opponent:
-            # Check if opponent switched (basic validation)
-            if hasattr(self, '_last_opponent_species') and self._last_opponent_species:
-                if self._last_opponent_species != opponent.species:
-                    # They switched - if we predicted it, count as correct
-                    if self._predicted_switch_last_turn:
-                        self.predictions_correct += 1
-                        
-            self._last_opponent_species = opponent.species
-            self._predicted_switch_last_turn = False  # Reset for this turn
-            
-        # CRITICAL FIX: Better lead selection and early game strategy  
-        if self.turn_count == 1:
-            # Learn their lead patterns for future battles
-            active_clean = active.species.lower().replace('-', '')
-            opponent_clean = opponent.species.lower().replace('-', '')
-            battle_id = getattr(battle, 'battle_tag', str(id(battle)))
-            
-            # Track opponent's lead (only once per battle)
-            if not hasattr(self, '_battles_tracked_for_leads'):
-                self._battles_tracked_for_leads = set()
-            
-            if battle_id not in self._battles_tracked_for_leads:
-                self._battles_tracked_for_leads.add(battle_id)
-                self.opponent_lead_history[opponent_clean] = self.opponent_lead_history.get(opponent_clean, 0) + 1
-            
-            if active_clean == 'arceusfairy' and opponent_clean == 'deoxysspeed':
-                # Don't let them get free spikes - switch to our Deoxys
-                available_switches = battle.available_switches
-                if available_switches:
-                    deoxys_switches = [p for p in available_switches if 'deoxysspeed' in p.species.lower()]
-                    if deoxys_switches:
-                        return self.create_order(deoxys_switches[0])
-                        
-            elif active_clean == 'kingambit' and opponent_clean in {'koraidon', 'zaciancrowned'}:
-                # Don't lead Kingambit vs Close Combat users
-                available_switches = battle.available_switches  
-                if available_switches:
-                    safe_switches = [p for p in available_switches if p.species.lower().replace('-', '') in ['arceusfairy', 'eternatus']]
-                    if safe_switches:
-                        return self.create_order(safe_switches[0])
-
-        if battle.available_moves and (
-                not self._should_switch_out(battle) or not battle.available_switches
-        ):
-            n_remaining_mons = len([m for m in battle.team.values() if m.fainted is False])
-            n_opp_remaining_mons = 6 - len([m for m in battle.opponent_team.values() if m.fainted is True])
-
-            # Minimax-based prediction plays using learned data
-            if self.turn_count > 2:  # Only after we have some learning data
-                # Look for high-confidence prediction opportunities
-                opponent_responses = self._predict_opponent_response(None, active, opponent, battle)
-                switch_probability = sum(prob for resp, prob in opponent_responses.items() if 'switch' in resp)
-                
-                if switch_probability > 0.7:  # Very likely to switch
-                    predicted_switch = self._predict_best_switch_in(battle)
-                    if predicted_switch and predicted_switch in self.opponent_tracker.known_pokemon:
-                        switch_types = self.opponent_tracker.known_pokemon[predicted_switch].types
-                        if switch_types:
-                            # Find moves that are super effective vs predicted switch
-                            prediction_moves = []
-                            for move in battle.available_moves:
-                                effectiveness = self._get_type_effectiveness(move.type.name, switch_types)
-                                if effectiveness >= 2.0:  # Super effective
-                                    prediction_value = move.base_power * effectiveness * 1.5  # STAB bonus
-                                    prediction_moves.append((move, prediction_value))
-                            
-                            if prediction_moves:
-                                best_prediction = max(prediction_moves, key=lambda x: x[1])
-                                prediction_move, prediction_value = best_prediction
-                                
-                                # Compare with minimax evaluation of normal moves
-                                best_normal_value = max(
-                                    self._minimax_evaluate_move(m, active, opponent, battle, depth=1) 
-                                    for m in battle.available_moves
-                                )
-                                
-                                # Only use prediction if it's significantly better
-                                if prediction_value > best_normal_value * 1.3:
-                                    self.predictions_made += 1
-                                    self._predicted_switch_last_turn = True
-                                    return self.create_order(prediction_move)
-
-            # Entry hazards with enhanced logic
-            for move in battle.available_moves:
-                if (
-                        n_opp_remaining_mons >= 3
-                        and move.id in self.ENTRY_HAZARDS
-                        and self.ENTRY_HAZARDS[move.id] not in battle.opponent_side_conditions
-                ):
-                    # More likely to set hazards against switching-heavy opponents
-                    if self.opponent_tracker.profile.switching_frequency > 0.3:
-                        return self.create_order(move)
-                    elif n_opp_remaining_mons >= 4:  # Only if they have many mons left
-                        return self.create_order(move)
-
-                # Hazard removal
-                elif (
-                        battle.side_conditions
-                        and move.id in self.ANTI_HAZARDS_MOVES
-                        and n_remaining_mons >= 2
-                ):
-                    return self.create_order(move)
-
-            # Enhanced setup logic
-            current_matchup = self._estimate_matchup(active, opponent)
-            if (
-                    active.current_hp_fraction >= 0.8
-                    and current_matchup > 0.5
-            ):
-                setup_moves = [
-                    move for move in battle.available_moves
-                    if (move.boosts
-                        and sum(move.boosts.values()) >= 2
-                        and move.target == Target.SELF
-                        and min([active.boosts[s] for s, v in move.boosts.items() if v > 0]) < 6)
-                ]
-
-                if setup_moves:
-                    # Less likely to setup against aggressive opponents who won't let us
-                    if self.opponent_tracker.profile.aggression_level < 0.6:
-                        return self.create_order(setup_moves[0])
-                    elif current_matchup > 1.0:  # Only if we have a really good matchup
-                        return self.create_order(setup_moves[0])
-
-            # Use minimax evaluation with accuracy considerations
-            move_values = {}
-            for move in battle.available_moves:
-                base_value = self._minimax_evaluate_move(move, active, opponent, battle, depth=1)
-                
-                # CRITICAL FIX: Account for accuracy issues
-                if move.id == 'fireblast' and move.accuracy < 1.0:
-                    # Fire Blast keeps missing - heavily penalize unless it's a KO
-                    predicted_damage = move.base_power * opponent.damage_multiplier(move)
-                    if predicted_damage < opponent.current_hp * 0.9:  # Not a likely KO
-                        base_value *= 0.3  # Heavy penalty for inaccurate moves that don't KO
-                        
-                # Bonus for guaranteed accuracy moves in critical situations
-                if move.accuracy == 1.0 and active.current_hp_fraction < 0.3:
-                    base_value *= 1.2
-                    
-                move_values[move] = base_value
-                
-            best_move = max(move_values.keys(), key=lambda m: move_values[m])
-
-            should_tera = self._should_tera(battle, n_remaining_mons)
-            return self.create_order(best_move, terastallize=should_tera)
-
-        if battle.available_switches:
-            switches: List[Pokemon] = battle.available_switches
-
-            # Enhanced switching logic with battle-specific improvements
-            switch_scores = {}
-            for switch in switches:
-                base_score = self._estimate_matchup(switch, opponent)
-
-                # CRITICAL: Avoid switching into obvious bad matchups
-                if switch.species.lower() in 'zaciancrowned' and opponent.species.lower() in 'zaciancrowned':
-                    base_score -= 1.0  # Heavy penalty for Zacian vs Zacian
-                    
-                if switch.species.lower() in ['kingambit'] and opponent.species.lower() in ['zaciancrowned', 'koraidon']:
-                    base_score -= 0.8  # Kingambit gets destroyed by Close Combat
-                    
-                # Prefer switches that resist opponent's likely moves
-                opponent_responses = self._predict_opponent_response(None, active, opponent, battle)
-                for response, prob in opponent_responses.items():
-                    if 'close_combat' in response and 'fairy' in str(switch.types).lower():
-                        base_score += prob * 0.5  # Fairy resists Fighting
-                    elif 'behemoth_blade' in response and switch.species.lower() in ['eternatus']:
-                        base_score += prob * 0.3  # Eternatus can live Behemoth Blade
-
-                # Bonus for unexpected switches against predictable opponents
-                if self.opponent_tracker.profile.risk_tolerance < 0.4:
-                    base_score += 0.2
-
-                switch_scores[switch] = base_score
-
-            best_switch = max(switches, key=lambda s: switch_scores[s])
-            return self.create_order(best_switch)
-
-        return self.choose_random_move(battle)
-    
-    def _get_optimal_lead(self, opponent_name: str = None) -> str:
-        """Determine optimal lead based on opponent patterns and learning data"""
-        
-        # If we know opponent's lead patterns, counter them
-        if self.opponent_lead_history:
-            most_common_opponent_lead = max(self.opponent_lead_history.keys(), 
-                                           key=lambda k: self.opponent_lead_history[k])
-            
-            # Counter their most common lead
-            lead_counters = {
-                'deoxysspeed': 'deoxysspeed',  # Speed tie for spikes
-                'koraidon': 'arceusfairy',     # Resists Close Combat
-                'zaciancrowned': 'eternatus',  # Can live Behemoth Blade
-                'kingambit': 'koraidon',       # Close Combat beats Kingambit
-                'arceusfairy': 'kingambit',    # Dark beats Fairy
-                'eternatus': 'kingambit',      # Can Sucker Punch
-            }
-            
-            if most_common_opponent_lead in lead_counters:
-                return lead_counters[most_common_opponent_lead]
-        
-        # Default leads based on battle count (adaptive strategy)
-        battle_mod = self.battle_count % 6
-        
-        if battle_mod == 0:
-            return 'kingambit'      # Aggressive lead with Sucker Punch
-        elif battle_mod == 1:
-            return 'deoxysspeed'    # Speed control and spikes
-        elif battle_mod == 2:
-            return 'zaciancrowned'  # Pure offense
-        elif battle_mod == 3:
-            return 'arceusfairy'    # Defensive pivot
-        elif battle_mod == 4:
-            return 'eternatus'      # Special attacker
-        else:
-            return 'koraidon'       # Physical powerhouse
-    
-    def teampreview(self, battle):
-        """Enhanced team preview with learned opponent data"""
-        # Only increment battle count once per unique battle
-        battle_id = getattr(battle, 'battle_tag', str(id(battle)))
-        if battle_id not in self.battles_seen:
-            self.battle_count += 1
-            self.battles_seen.add(battle_id)
-        
-        # Learn opponent team composition
-        if hasattr(battle, 'opponent_team') and battle.opponent_team:
-            for species, pokemon in battle.opponent_team.items():
-                self.opponent_tracker.team_preview_seen.add(species)
-                self.opponent_tracker.add_pokemon(species, pokemon)
-        
-        # Get opponent name for personalized strategy
-        opponent_name = getattr(battle, 'opponent_username', None)
-        
-        # Determine optimal lead
-        preferred_lead = self._get_optimal_lead(opponent_name)
-        
-        # Find the preferred lead in our team
-        team_list = list(battle.team.values())
-        for i, pokemon in enumerate(team_list):
-            species_clean = pokemon.species.lower().replace('-', '')
-            if species_clean == preferred_lead or pokemon.species == preferred_lead:
-                return f"/team {i + 1}"
-        
-        # Fallback: Try to find any of our good leads
-        fallback_leads = ['kingambit', 'deoxysspeed', 'zaciancrowned']
-        for lead in fallback_leads:
-            for i, pokemon in enumerate(team_list):
-                if pokemon.species.lower().replace('-', '') == lead or pokemon.species == lead:
-                    return f"/team {i + 1}"
-        
-        return "/team 1"
-    
-    def choose_team_preview(self, battle):
-        """Alternative method name that poke-env might use"""
-        return self.teampreview(battle)
-    
-    def team_preview(self, battle):
-        """Another alternative method name"""
-        return self.teampreview(battle)
-    
-    def _on_battle_end(self, battle: AbstractBattle):
-        """Track performance and learning outcomes"""
-        self.battles_total += 1
-        if battle.won:
-            self.battles_won += 1
-            
-        # Calculate win rate
-        win_rate = self.battles_won / self.battles_total if self.battles_total > 0 else 0
-        
-        # Learning happens silently to avoid console spam
-        pass
+        info = make_infoset(battle)
+        adapter = PokeEnvAdapter(self, battle, self.gendata, heuristics_fn=None, iters_time_budget_s=self._time_s)
+        result = ismcts_search(
+            root_info=info,
+            env_adapter=adapter,
+            gendata=self.gendata,
+            max_iters=self._iters,
+            uct_c=self._uct_c,
+            time_budget_s=self._time_s,
+        )
+        return adapter.to_battle_order(result.best_action)
