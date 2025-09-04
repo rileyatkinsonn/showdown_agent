@@ -204,9 +204,43 @@ def make_infoset(battle: AbstractBattle) -> Infoset:
 # ============================================================
 
 # You can flesh this out per species if you want; keep it small and expert-coded (no ML)
-SPECIES_PRIORS: Dict[str, Dict[str, Any]] = {
-    # "zaciancrowned": {"tera": ["flying", "steel"], "items": ["rustedsword"], "common_moves": ["behemothblade","closecombat","wildcharge","swordsdance"]},
-    # ...
+SPECIES_PRIORS = {
+    "deoxysspeed": {
+        "items": ["focussash"],
+        "tera": ["ghost"],
+        "ev": "offensive",
+        "common_moves": ["psychoboost","taunt","spikes","thunderwave"],
+    },
+    "kingambit": {
+        "items": ["dreadplate","blackglasses","leftovers"],
+        "tera": ["dark","flying"],
+        "ev": "offensive",
+        "common_moves": ["suckerpunch","kowtowcleave","ironhead","swordsdance"],
+    },
+    "zaciancrowned": {
+        "items": ["rustedsword"],
+        "tera": ["flying","steel"],
+        "ev": "offensive",
+        "common_moves": ["behemothblade","closecombat","wildcharge","swordsdance"],
+    },
+    "arceusfairy": {
+        "items": ["pixieplate"],
+        "tera": ["fire","fairy"],
+        "ev": "bulky",
+        "common_moves": ["judgment","calmmind","recover","taunt"],
+    },
+    "eternatus": {
+        "items": ["powerherb","blacksludge"],
+        "tera": ["fire","poison"],
+        "ev": "offensive",
+        "common_moves": ["meteorbeam","dynamaxcannon","fireblast","agility"],
+    },
+    "koraidon": {
+        "items": ["lifeorb","choiceband"],
+        "tera": ["fire","dragon"],
+        "ev": "offensive",
+        "common_moves": ["closecombat","scaleshot","flamecharge","swordsdance"],
+    },
 }
 
 def sample_determinization(info: Infoset, gendata: GenData) -> ConcreteState:
@@ -518,17 +552,44 @@ class RolloutEnv:
             self.s.my_kos += 1
 
     def _opponent_policy(self) -> str:
-        # extremely small opponent policy; you can bias by revealed moves or your tracker
-        # prefer attack; sometimes setup; sometimes tera early if not used
-        r = random.random()
-        if not self.s.opp_tera_used and r < 0.1:
+        # Species/move-aware greedy policy that matches simple-uber tendencies.
+        me_types = set(self.me_types)
+        opp_types = set(self.opp_types)
+
+        # If opponent hasn't Tera'd, occasionally Tera to convert neutral → stab
+        if not self.s.opp_tera_used and random.random() < 0.08:
             return "TERA_ATTACK"
-        if r < 0.7:
+
+        # Zacian-Crowned heuristics
+        if "steel" in opp_types and "fairy" in opp_types:
+            # vs Kingambit -> strongly prefer Close Combat (we model as ATTACK but it's "strong")
             return "ATTACK"
-        if r < 0.85:
+
+        # Kingambit heuristics: if we (defender) are low, Sucker Punch-like pressure => ATTACK
+        if "dark" in opp_types and "steel" in opp_types:
+            return "ATTACK"
+
+        # Deoxys-S: early hazards if we (defender) at full; otherwise attack
+        if "psychic" in opp_types and random.random() < 0.35 and self.s.ply < 3:
+            return "HAZARD"
+
+        # Arceus-Fairy: prefers Judgment unless setting up is safe (early, they are healthy)
+        if "fairy" in opp_types and random.random() < 0.2 and self.s.ply < 2 and self.s.opp_hp_bin >= 7:
             return "SETUP"
-        if r < 0.95:
-            return "SWITCH"
+
+        # Eternatus: if Power Herb assumed and ply==0, use Meteor Beam (modeled as ATTACK)
+        if "poison" in opp_types and random.random() < 0.1:
+            return "SETUP"  # tiny chance it “preps”; otherwise attacks
+
+        # Koraidon: mostly attack; sometimes set up early
+        if "dragon" in opp_types and "fighting" in opp_types:
+            return "ATTACK" if random.random() < 0.8 else "SETUP"
+
+        # Fallbacks
+        r = random.random()
+        if r < 0.75: return "ATTACK"
+        if r < 0.90: return "SETUP"
+        if r < 0.97: return "SWITCH"
         return "HAZARD"
 
     def rollout_evaluate(self, max_plies: int = 6) -> Reward:
@@ -624,14 +685,35 @@ def ismcts_search(root_info: Infoset,
     return SearchResult(best_action=best, action_stats=stats)
 
 
+def _rough_damage(adapter: PokeEnvAdapter, move, atk, dfnd) -> float:
+    if not (atk and dfnd and move): return 0.0
+    bp = move.base_power or 0
+    acc = move.accuracy if move.accuracy is not None else 1.0
+    stab = 1.5 if (move.type and move.type in atk.types) else 1.0
+    mult = dfnd.damage_multiplier(move)
+    prio = getattr(move, "priority", 0) or 0
+    return bp * stab * mult * acc * (1.0 + 0.05 * prio)
+
 def _root_prior(adapter: PokeEnvAdapter, a: Action) -> float:
-    # Prior for root ordering / progressive widening synergy
+    me = adapter.battle.active_pokemon
+    opp = adapter.battle.opponent_active_pokemon
+    if not (me and opp): return 0.0
     kind, payload = a
+    # SWITCH: prioritize good type matchup
     if kind == "switch":
-        # small bonus if switching into good type vs current opp
-        return 0.5 * adapter._estimate_matchup(payload, adapter.battle.opponent_active_pokemon)
-    else:
-        return adapter._move_value(payload, adapter.battle.active_pokemon, adapter.battle.opponent_active_pokemon)
+        return 0.8 * adapter._estimate_matchup(payload, opp)
+    # MOVE or TERA_MOVE
+    mv = payload
+    dmg = _rough_damage(adapter, mv, me, opp)
+    # Simple KO check proxy: dmg compared to a scaled HP bucket
+    ko_bias = 0.7 if dmg >= 0.9 * 100 else 0.0  # coarse; you can replace with better HP scaling
+    # Death check: if opponent obviously KOs us next turn (Zacian vs Gambit)
+    death_bias = 0.0
+    if "zaciancrowned" in getattr(opp, "species", "") and "kingambit" in getattr(me, "species", ""):
+        death_bias = -1.0
+    # Favor accurate moves in tight spots
+    acc_bonus = 0.1 if (mv.accuracy or 1.0) >= 0.95 else 0.0
+    return dmg / 100.0 + ko_bias + acc_bonus + death_bias
 
 
 
