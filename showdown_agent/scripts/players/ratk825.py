@@ -889,24 +889,33 @@ def _find_our(self, battle, wanted: List[str]) -> Optional[int]:
 
 # --- lead policy vs common Ubers teams (Deo-S / Zacian / Koraidon / Gambit / Arceus-F / Eternatus) ---
 def teampreview(self, battle):
-    # Try Deoxys-Speed first; else Zacian; else Arceus-Fairy; fallback to 1
-    order = ["deoxysspeed", "zaciancrowned", "arceusfairy", "koraidon", "eternatus", "kingambit"]
+    # ADAPTIVE LEAD STRATEGY: Back to Kingambit with improved move selection
+    preferred_lead = "deoxysspeed"  # default lead
+
+    # Find the preferred lead
     team_list = list(battle.team.values())
-    idx = 1
-    seen = {self._norm(p.species): i+1 for i,p in enumerate(team_list)}
-    for want in order:
-        if want in seen:
-            idx = seen[want]
-            break
-    print(f"Teampreview chose slot {idx} ({battle.team[idx-1].species})")
-    return f"/team {idx}"
+    for i, pokemon in enumerate(team_list):
+        if pokemon.species == preferred_lead:
+            return f"/team {i + 1}"
 
-def choose_team_preview(self, battle): return self.teampreview(battle)
-def team_preview(self, battle): return self.teampreview(battle)
+    # Fallback to zacian
+    for i, pokemon in enumerate(team_list):
+        if pokemon.species == 'zaciancrowned' or pokemon.species == 'zacian':
+            return f"/team {i + 1}"
 
-# Poke-env sometimes calls alternate names; keep them wired up:
+    # fall back to arceus-fairy
+    for i, pokemon in enumerate(team_list):
+        if pokemon.species == 'arceusfairy' or pokemon.species == 'arceus':
+            return f"/team {i + 1}"
+
+    return "/team 1"
+
+
 def choose_team_preview(self, battle):
+    """Alternative method name that poke-env might use"""
     return self.teampreview(battle)
 
+
 def team_preview(self, battle):
+    """Another alternative method name"""
     return self.teampreview(battle)
