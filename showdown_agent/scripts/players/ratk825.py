@@ -133,6 +133,43 @@ class CustomAgent(Player):
         hazard_pressure = our_hazards * 2 + vulnerable_count
         return hazard_pressure
 
+    def _detect_setup_threats(self, battle: AbstractBattle):
+        """Detect when opponent has setup sweepers that need immediate attention"""
+        setup_threats = []
+        
+        for species, pokemon in battle.opponent_team.items():
+            if pokemon and not pokemon.fainted:
+                threat_score = 0
+                setup_moves = []
+                
+                # Check for setup moves in revealed moveset
+                for move_id in pokemon.moves:
+                    if move_id in self.SETUP_MOVES:
+                        setup_moves.append(move_id)
+                        if move_id in ['swordsdance', 'dragondance']:
+                            threat_score += 3  # Physical setup very dangerous
+                        elif move_id in ['calmmind', 'nastyplot']:
+                            threat_score += 3  # Special setup very dangerous
+                        elif move_id == 'agility':
+                            threat_score += 2  # Speed setup dangerous
+                        else:
+                            threat_score += 2
+                
+                # High HP setup sweepers are immediate threats
+                if setup_moves and pokemon.current_hp_fraction >= 0.7:
+                    threat_score += 2
+                
+                # Boosted Pokemon are critical threats
+                if pokemon.boosts:
+                    for stat, boost in pokemon.boosts.items():
+                        if boost > 0 and stat in ['atk', 'spa', 'spe']:
+                            threat_score += boost * 2
+                
+                if threat_score > 0:
+                    setup_threats.append((pokemon, threat_score, setup_moves))
+        
+        return sorted(setup_threats, key=lambda x: x[1], reverse=True)
+
     def _analyze_opponent_team(self, battle: AbstractBattle):
         threats = []
         for species, pokemon in battle.opponent_team.items():
@@ -385,6 +422,46 @@ class CustomAgent(Player):
                     if best_resistant[1] >= 2:  # Good resistance score
                         return self.create_order(best_resistant[0])
             
+            # Setup threat management: Priority #1
+            setup_threats = self._detect_setup_threats(battle)
+            if setup_threats:
+                biggest_setup_threat = setup_threats[0]  # (pokemon, threat_score, setup_moves)
+                threat_pokemon, threat_score, setup_moves = biggest_setup_threat
+                
+                # High priority: counter immediate setup threats
+                if threat_score >= 5:  # Critical setup threat
+                    best_counter = None
+                    best_counter_score = -999
+                    
+                    for switch in switches:
+                        counter_score = 0
+                        
+                        # Prioritize Pokemon that resist the setup sweeper
+                        matchup = self._estimate_matchup(switch, threat_pokemon)
+                        if matchup > 0:
+                            counter_score += matchup * 2
+                        
+                        # Taunt users counter setup
+                        if 'taunt' in switch.moves:
+                            counter_score += 3
+                        
+                        # Priority move users can revenge kill
+                        for move_id in switch.moves:
+                            if move_id in self.PRIORITY_MOVES:
+                                counter_score += 2
+                                break
+                        
+                        # Defensive Pokemon can often handle setup sweepers
+                        if switch.species == 'arceusfairy' and switch.current_hp_fraction > 0.6:
+                            counter_score += 2
+                        
+                        if counter_score > best_counter_score:
+                            best_counter_score = counter_score
+                            best_counter = switch
+                    
+                    if best_counter and best_counter_score >= 3:
+                        return self.create_order(best_counter)
+
             # Enhanced switch selection considering opponent team
             predicted_switch = self._predict_opponent_switch(battle)
             
