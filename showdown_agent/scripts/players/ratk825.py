@@ -76,83 +76,11 @@ Jolly Nature
 """
 
 
-@dataclass
-class OpponentPokemon:
-    """Tracks what we know about an opponent's Pokemon"""
-    species: str
-    types: List[str] = field(default_factory=list)
-    moves_seen: Set[str] = field(default_factory=set)
-    ability: Optional[str] = None
-    item: Optional[str] = None
-    current_hp_fraction: float = 1.0
-    is_alive: bool = True
-    status: Optional[str] = None
-    
-    def add_move(self, move_id: str):
-        self.moves_seen.add(move_id)
-    
-    def update_hp(self, hp_fraction: float):
-        self.current_hp_fraction = hp_fraction
-        if hp_fraction <= 0:
-            self.is_alive = False
-
-class OpponentTracker:
-    """Tracks opponent team and battle state"""
-    def __init__(self):
-        self.known_pokemon: Dict[str, OpponentPokemon] = {}
-        self.team_preview_seen: Set[str] = set()
-        self.active_pokemon_history: List[str] = []
-        
-    def add_pokemon(self, species: str, pokemon: Pokemon = None):
-        """Add a new Pokemon to our knowledge"""
-        if species not in self.known_pokemon:
-            types = [str(t) for t in pokemon.types] if pokemon and pokemon.types else []
-            self.known_pokemon[species] = OpponentPokemon(
-                species=species,
-                types=types,
-                current_hp_fraction=pokemon.current_hp_fraction if pokemon else 1.0,
-                is_alive=not pokemon.fainted if pokemon else True,
-                status=pokemon.status.name if pokemon and pokemon.status else None
-            )
-            
-    def update_pokemon(self, species: str, pokemon: Pokemon):
-        """Update known info about a Pokemon"""
-        if species not in self.known_pokemon:
-            self.add_pokemon(species, pokemon)
-        else:
-            opp_mon = self.known_pokemon[species]
-            opp_mon.current_hp_fraction = pokemon.current_hp_fraction
-            opp_mon.is_alive = not pokemon.fainted
-            opp_mon.status = pokemon.status.name if pokemon.status else None
-            if pokemon.types:
-                opp_mon.types = [str(t) for t in pokemon.types]
-                
-    def log_move_used(self, species: str, move_id: str):
-        """Record that we saw this Pokemon use this move"""
-        if species in self.known_pokemon:
-            self.known_pokemon[species].add_move(move_id)
-            
-    def get_alive_count(self) -> int:
-        """Get number of opponent Pokemon still alive"""
-        return sum(1 for mon in self.known_pokemon.values() if mon.is_alive)
-        
-    def predict_switch_likelihood(self, current_matchup_score: float) -> float:
-        """Predict how likely opponent is to switch based on matchup"""
-        if current_matchup_score < -2.0:  # Very bad matchup for them
-            return 0.7  # Likely to switch
-        elif current_matchup_score < -1.0:  # Bad matchup
-            return 0.4  # Somewhat likely
-        elif current_matchup_score > 1.5:  # Good matchup for them
-            return 0.1  # Very unlikely to switch
-        else:
-            return 0.2  # Default low chance
-
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
         
         # Battle state tracking
-        self.opponent_tracker = OpponentTracker()
         self._last_switched_turn = -2
         self._tera_used = False
         self.gen_data = GenData.from_gen(9)  # Gen 9 type chart and data
@@ -333,3 +261,21 @@ class CustomAgent(Player):
             )
 
         return self.choose_random_move(battle)
+
+    def teampreview(self, battle):
+        team_list = list(battle.team.values())
+        preferred = ['deoxysspeed', 'kingambit', 'zaciancrowned']
+        for i, p in enumerate(team_list):
+            if p.species in preferred:
+                return f"/team {i + 1}"
+        return "/team 1"
+
+    # poke-env alt names
+    def choose_team_preview(self, battle):
+        return self.teampreview(battle)
+
+    def team_preview(self, battle):
+        return self.teampreview(battle)
+
+
+
