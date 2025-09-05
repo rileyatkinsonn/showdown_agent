@@ -762,9 +762,11 @@ def _root_prior(adapter: PokeEnvAdapter, a: Action) -> float:
     if "zaciancrowned" in getattr(opp, "species", "") and "kingambit" in getattr(me, "species", ""):
         death_bias = -2.0
         
-    # Don't Tera early unless critical
-    if kind == "tera_move" and adapter.battle.turn <= 3:
-        death_bias -= 1.0
+    # STRONG penalty against early Tera (Turns 1-4)
+    if kind == "tera_move" and adapter.battle.turn <= 4:
+        me_hp_frac = getattr(me, 'current_hp_fraction', 1.0)
+        if me_hp_frac > 0.25:  # Not in dire emergency
+            death_bias -= 5.0  # Very strong penalty
     
     # Favor accurate moves in tight spots
     acc_bonus = 0.1 if (mv.accuracy or 1.0) >= 0.95 else 0.0
@@ -801,6 +803,19 @@ class CustomAgent(Player):
         opp = battle.opponent_active_pokemon
         me_s = self._norm(getattr(me, "species", None))
         opp_s = self._norm(getattr(opp, "species", None))
+
+        # CRITICAL: Block all early Tera usage (Turns 1-4) unless in dire emergency
+        if not battle.used_tera and battle.turn <= 4:
+            # Only allow Tera if we're about to die AND Tera changes the outcome
+            me_hp = getattr(me, "current_hp_fraction", 1.0)
+            if me_hp > 0.25:  # Not in dire emergency
+                # Force non-Tera moves by checking available moves without Tera
+                for move in (battle.available_moves or []):
+                    # Return first available move without Tera
+                    return self.create_order(move, terastallize=False)
+                # If no moves, allow switches
+                if battle.available_switches:
+                    return self.create_order(battle.available_switches[0])
 
         # Never Tera Deoxys-S (it makes you weak to Sucker Punch & doesn't help vs Zacian)
         # If Deoxys vs Deoxys, Taunt > Spikes (deny their layers first).
