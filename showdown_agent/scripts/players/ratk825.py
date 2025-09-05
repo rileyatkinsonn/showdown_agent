@@ -466,6 +466,75 @@ class CustomAgent(Player):
         
         return coverage_gaps
 
+    def _is_win_condition(self, pokemon):
+        """Identify if this Pokemon is a win condition that should be preserved"""
+        return pokemon.species in ['koraidon', 'zaciancrowned']  # Key sweepers in this meta
+
+    def _protect_win_condition(self, battle: AbstractBattle):
+        """Special logic to protect win condition Pokemon"""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        
+        if not self._is_win_condition(active) or not opponent:
+            return False
+        
+        # Don't switch out if we're in a great position
+        if (active.current_hp_fraction > 0.8 and 
+            self._estimate_matchup(active, opponent) > 1.0):
+            return False
+        
+        # CRITICAL: Switch out win condition if:
+        # 1. Taking super effective damage
+        matchup_score = self._estimate_matchup(active, opponent)
+        if matchup_score < -1.5:  # Very bad matchup
+            return True
+        
+        # 2. Low HP and opponent can revenge kill
+        if active.current_hp_fraction < 0.4:
+            for move_id in opponent.moves:
+                if move_id in self.PRIORITY_MOVES:  # Priority moves can revenge kill
+                    return True
+        
+        # 3. Opponent has setup moves and can sweep
+        if (active.current_hp_fraction < 0.6 and
+            any(move_id in self.SETUP_MOVES for move_id in opponent.moves)):
+            return True
+        
+        # 4. Multiple threats remain - preserve for endgame
+        n_opp_remaining = len([p for p in battle.opponent_team.values() 
+                              if p and not p.fainted])
+        n_our_remaining = len([p for p in battle.team.values() 
+                              if not p.fainted])
+        
+        if (n_opp_remaining >= 3 and n_our_remaining >= 3 and 
+            active.current_hp_fraction < 0.7):
+            return True
+        
+        return False
+
+    def _get_win_condition_safe_switch(self, battle: AbstractBattle):
+        """Find the safest switch to preserve win condition"""
+        available_switches = battle.available_switches
+        opponent = battle.opponent_active_pokemon
+        
+        if not available_switches or not opponent:
+            return None
+        
+        # Prioritize defensive Pokemon for safe switching
+        defensive_priority = ['arceusfairy', 'eternatus', 'deoxysspeed']
+        
+        for priority_species in defensive_priority:
+            for switch in available_switches:
+                if (switch.species == priority_species and 
+                    switch.current_hp_fraction > 0.5):
+                    matchup = self._estimate_matchup(switch, opponent)
+                    if matchup > -1.0:  # Not terrible matchup
+                        return switch
+        
+        # Fallback: best available matchup
+        return max(available_switches, 
+                  key=lambda s: self._estimate_matchup(s, opponent))
+
     def _analyze_opponent_team(self, battle: AbstractBattle):
         threats = []
         for species, pokemon in battle.opponent_team.items():
@@ -512,15 +581,55 @@ class CustomAgent(Player):
                     return threat_pokemon
         return None
 
+    def _is_tera_safe(self, pokemon, battle: AbstractBattle):
+        """Check if Teraing would put us in immediate danger"""
+        opponent = battle.opponent_active_pokemon
+        if not opponent:
+            return True
+        
+        # Get current Tera type
+        current_tera_type = getattr(pokemon, 'tera_type', None)
+        if not current_tera_type:
+            return True
+        
+        # Check if opponent has moves that would be super effective after Tera
+        for move_id in opponent.moves:
+            move_data = self._get_move_data(move_id)
+            if move_data and 'type' in move_data:
+                move_type = move_data['type']
+                # Calculate effectiveness vs our Tera type
+                effectiveness = self._calculate_type_effectiveness(move_type, [current_tera_type])
+                if effectiveness >= 2.0:  # Super effective
+                    return False
+        
+        # Check type effectiveness vs opponent types
+        for opp_type in opponent.types:
+            if opp_type:
+                effectiveness = self._calculate_type_effectiveness(str(opp_type), [current_tera_type])
+                if effectiveness >= 2.0:  # They resist us heavily
+                    return False
+        
+        return True
+
     def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
         if battle.can_tera:
             active = battle.active_pokemon
+            opponent = battle.opponent_active_pokemon
+            
+            # CRITICAL: Never Tera if it puts us in immediate danger
+            if not self._is_tera_safe(active, battle):
+                return False
+            
+            # Don't Tera if opponent can OHKO us after Tera
+            if (opponent and active.current_hp_fraction < 0.6 and 
+                self._estimate_matchup(active, opponent) < -1):
+                return False
             
             # Evaluate optimal Tera type
             best_tera, tera_score = self._evaluate_tera_options(active, battle)
             
-            # Use Tera if we get significant benefit (score > 1.0)
-            if tera_score > 1.0:
+            # Use Tera if we get significant benefit (score > 1.5, raised threshold)
+            if tera_score > 1.5:
                 # Last full HP mon
                 if (
                         len([m for m in battle.team.values() if m.current_hp_fraction == 1])
@@ -528,23 +637,28 @@ class CustomAgent(Player):
                         and active.current_hp_fraction == 1
                 ):
                     return True
-                # Significant type advantage gained
-                if tera_score > 2.0 and active.current_hp_fraction > 0.5:
+                # Significant type advantage gained and safe HP
+                if tera_score > 3.0 and active.current_hp_fraction > 0.7:
                     return True
-                # Matchup advantage and full hp on full hp
+                # Matchup advantage and both at high HP
                 if (
-                        self._estimate_matchup(active, battle.opponent_active_pokemon) > 0
-                        and active.current_hp_fraction == 1
-                        and battle.opponent_active_pokemon.current_hp_fraction == 1
+                        self._estimate_matchup(active, opponent) > 0.5
+                        and active.current_hp_fraction >= 0.8
+                        and opponent and opponent.current_hp_fraction >= 0.8
                 ):
                     return True
-                if n_remaining_mons == 1:
+                # Desperate endgame
+                if n_remaining_mons == 1 and active.current_hp_fraction > 0.3:
                     return True
         return False
 
     def _should_switch_out(self, battle: AbstractBattle):
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
+        
+        # PRIORITY: Protect win conditions (Koraidon/Zacian)
+        if self._protect_win_condition(battle):
+            return True
         
         # Enhanced switch logic considering opponent threats
         predicted_switch = self._predict_opponent_switch(battle)
@@ -621,12 +735,19 @@ class CustomAgent(Player):
         endgame = self._assess_endgame_situation(battle)
         momentum = self._detect_momentum_opportunities(battle)
 
+        # ENDGAME AGGRESSION: Never switch in critical endgames with win conditions
+        force_attack = False
+        n_remaining_mons = len([m for m in battle.team.values() if m.fainted is False])
+        if (endgame['is_endgame'] and 
+            self._is_win_condition(active) and 
+            n_remaining_mons <= 2 and
+            active.current_hp_fraction > 0.2):
+            force_attack = True
+
         if battle.available_moves and (
+                force_attack or 
                 not self._should_switch_out(battle) or not battle.available_switches
         ):
-            n_remaining_mons = len(
-                [m for m in battle.team.values() if m.fainted is False]
-            )
             n_opp_remaining_mons = 6 - len(
                 [m for m in battle.opponent_team.values() if m.fainted is True]
             )
@@ -743,10 +864,26 @@ class CustomAgent(Player):
                     (momentum['momentum_score'] >= 4 and endgame['is_endgame'])):
                     should_tera = True
             
+            # ENDGAME AGGRESSION: In Koraidon vs Koraidon endgames, be maximally aggressive
+            if (endgame['is_endgame'] and 
+                active.species == 'koraidon' and 
+                opponent.species == 'koraidon' and
+                n_remaining_mons <= 2):
+                # Force Scale Shot over other moves in mirror match
+                for move in battle.available_moves:
+                    if move.id == 'scaleshot':
+                        return self.create_order(move, terastallize=should_tera)
+            
             return self.create_order(best_move, terastallize=should_tera)
 
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
+            
+            # PRIORITY: Win condition protection - use safe switch if protecting Koraidon/Zacian
+            if self._protect_win_condition(battle):
+                safe_switch = self._get_win_condition_safe_switch(battle)
+                if safe_switch:
+                    return self.create_order(safe_switch)
             
             # Hazard management: prioritize Pokemon that can handle hazard pressure
             hazard_pressure = self._evaluate_hazard_pressure(battle)
