@@ -170,6 +170,112 @@ class CustomAgent(Player):
         
         return sorted(setup_threats, key=lambda x: x[1], reverse=True)
 
+    def _assess_endgame_situation(self, battle: AbstractBattle):
+        """Determine if we're in endgame and should prioritize winning over safety"""
+        our_remaining = len([p for p in battle.team.values() if not p.fainted])
+        opp_remaining = len([p for p in battle.opponent_team.values() if p and not p.fainted])
+        
+        # Endgame indicators
+        total_remaining = our_remaining + opp_remaining
+        is_endgame = total_remaining <= 4
+        
+        # Calculate our advantage/disadvantage
+        advantage_score = 0
+        
+        # Pokemon count advantage
+        if our_remaining > opp_remaining:
+            advantage_score += (our_remaining - opp_remaining) * 2
+        elif opp_remaining > our_remaining:
+            advantage_score -= (opp_remaining - our_remaining) * 2
+        
+        # HP advantage in remaining pokemon
+        our_total_hp = sum(p.current_hp_fraction for p in battle.team.values() if not p.fainted)
+        opp_total_hp = sum(p.current_hp_fraction for p in battle.opponent_team.values() if p and not p.fainted)
+        
+        if our_total_hp > opp_total_hp:
+            advantage_score += (our_total_hp - opp_total_hp) * 3
+        else:
+            advantage_score -= (opp_total_hp - our_total_hp) * 3
+        
+        # Win condition assessment
+        win_urgency = 0
+        if is_endgame:
+            if advantage_score < -2:  # We're behind
+                win_urgency = 3  # Very urgent - need to take risks
+            elif advantage_score < 0:  # Slightly behind
+                win_urgency = 2  # Moderately urgent
+            elif advantage_score > 2:  # We're ahead
+                win_urgency = -1  # Play safe, don't throw
+            else:  # Even
+                win_urgency = 1  # Slight urgency
+        
+        return {
+            'is_endgame': is_endgame,
+            'our_remaining': our_remaining,
+            'opp_remaining': opp_remaining,
+            'advantage_score': advantage_score,
+            'win_urgency': win_urgency
+        }
+
+    def _detect_momentum_opportunities(self, battle: AbstractBattle):
+        """Identify when opponent is in a bad position we can exploit"""
+        momentum_score = 0
+        opportunities = []
+        
+        opponent = battle.opponent_active_pokemon
+        if not opponent:
+            return {'momentum_score': 0, 'opportunities': []}
+        
+        # Opponent weakened and we have advantage
+        if opponent.current_hp_fraction < 0.5:
+            active_matchup = self._estimate_matchup(battle.active_pokemon, opponent)
+            if active_matchup > 0:
+                momentum_score += 2
+                opportunities.append("opponent_low_hp_good_matchup")
+        
+        # Opponent has stat drops
+        negative_boosts = sum(min(0, boost) for boost in opponent.boosts.values())
+        if negative_boosts < -2:
+            momentum_score += 2
+            opportunities.append("opponent_debuffed")
+        
+        # We have setup opportunities (opponent can't threaten us)
+        if (battle.active_pokemon.current_hp_fraction > 0.7 and 
+            self._estimate_matchup(battle.active_pokemon, opponent) > 1):
+            # Check if we have setup moves
+            for move in battle.available_moves:
+                if (move.boosts and sum(move.boosts.values()) >= 2 and 
+                    move.target == "self"):
+                    momentum_score += 3
+                    opportunities.append("setup_opportunity")
+                    break
+        
+        # Multiple opponent pokemon at low HP
+        low_hp_opponents = sum(1 for p in battle.opponent_team.values() 
+                              if p and not p.fainted and p.current_hp_fraction < 0.4)
+        if low_hp_opponents >= 2:
+            momentum_score += 2
+            opportunities.append("multiple_weak_opponents")
+        
+        # Opponent forced into bad switches (no good options)
+        if self._estimate_matchup(battle.active_pokemon, opponent) > 1.5:
+            # Check if opponent has any good switch options
+            good_switches = 0
+            for opp_pokemon in battle.opponent_team.values():
+                if (opp_pokemon and not opp_pokemon.fainted and 
+                    opp_pokemon.species != opponent.species):
+                    if self._estimate_matchup(battle.active_pokemon, opp_pokemon) <= 0:
+                        good_switches += 1
+            
+            if good_switches <= 1:
+                momentum_score += 2
+                opportunities.append("opponent_limited_switches")
+        
+        return {
+            'momentum_score': momentum_score,
+            'opportunities': opportunities
+        }
+
     def _analyze_opponent_team(self, battle: AbstractBattle):
         threats = []
         for species, pokemon in battle.opponent_team.items():
@@ -313,6 +419,10 @@ class CustomAgent(Player):
             opponent, "spd"
         )
 
+        # Assess current battle state
+        endgame = self._assess_endgame_situation(battle)
+        momentum = self._detect_momentum_opportunities(battle)
+
         if battle.available_moves and (
                 not self._should_switch_out(battle) or not battle.available_switches
         ):
@@ -341,15 +451,26 @@ class CustomAgent(Player):
                 ):
                     return self.create_order(move)
 
-            # Enhanced setup logic considering opponent team
+            # Enhanced setup logic with endgame and momentum considerations
             threats = self._analyze_opponent_team(battle)
             high_threat_count = sum(1 for _, threat_level in threats if threat_level >= 2)
             
-            if (
-                    active.current_hp_fraction == 1
+            # More aggressive setup in favorable endgame situations
+            setup_threshold = 0 if endgame['win_urgency'] >= 2 else 0.8
+            threat_limit = 3 if endgame['win_urgency'] >= 2 else 2
+            
+            # Prioritize setup when we have momentum
+            should_setup = False
+            if momentum['momentum_score'] >= 3 and "setup_opportunity" in momentum['opportunities']:
+                should_setup = True  # Force setup when we have a clear opportunity
+            elif (
+                    active.current_hp_fraction >= setup_threshold
                     and self._estimate_matchup(active, opponent) > 0
-                    and high_threat_count <= 2  # Don't setup if too many threats remain
+                    and high_threat_count <= threat_limit
             ):
+                should_setup = True
+            
+            if should_setup:
                 for move in battle.available_moves:
                     if (
                             move.boosts
@@ -360,15 +481,19 @@ class CustomAgent(Player):
                     )
                             < 6
                     ):
-                        # Extra check: don't setup if opponent has priority moves
+                        # In endgame or with momentum, be more aggressive about setup
                         has_priority = any(move_id in self.PRIORITY_MOVES 
                                          for move_id in opponent.moves)
-                        if not has_priority or active.current_hp_fraction > 0.8:
+                        if (not has_priority or 
+                            active.current_hp_fraction > 0.8 or 
+                            endgame['win_urgency'] >= 2 or
+                            momentum['momentum_score'] >= 3):
                             return self.create_order(move)
 
-            move = max(
-                battle.available_moves,
-                key=lambda m: m.base_power
+            # Enhanced move selection with endgame/momentum consideration
+            move_scores = []
+            for m in battle.available_moves:
+                base_score = (m.base_power
                               * (1.5 if m.type in active.types else 1)
                               * (
                                   physical_ratio
@@ -377,9 +502,37 @@ class CustomAgent(Player):
                               )
                               * m.accuracy
                               * m.expected_hits
-                              * opponent.damage_multiplier(m),
-            )
-            return self.create_order(move, terastallize=self._should_tera(battle, n_remaining_mons))
+                              * opponent.damage_multiplier(m))
+                
+                # Boost aggressive moves in endgame/momentum situations
+                if endgame['win_urgency'] >= 2 or momentum['momentum_score'] >= 2:
+                    # Prioritize high power moves when we need to win
+                    if m.base_power >= 100:
+                        base_score *= 1.3
+                    # Prioritize multi-hit moves that can break through
+                    if m.expected_hits > 1:
+                        base_score *= 1.2
+                
+                # In advantageous endgame, prioritize moves that secure wins
+                if endgame['is_endgame'] and endgame['advantage_score'] > 0:
+                    # Prioritize moves that can KO
+                    estimated_damage = base_score / (opponent.current_hp_fraction * 100)
+                    if estimated_damage >= 0.8:  # Likely KO
+                        base_score *= 1.4
+                
+                move_scores.append((m, base_score))
+            
+            best_move = max(move_scores, key=lambda x: x[1])[0]
+            
+            # More aggressive tera usage in critical moments
+            should_tera = self._should_tera(battle, n_remaining_mons)
+            if not should_tera and battle.can_tera:
+                # Force tera in critical endgame situations
+                if (endgame['win_urgency'] >= 3 or 
+                    (momentum['momentum_score'] >= 4 and endgame['is_endgame'])):
+                    should_tera = True
+            
+            return self.create_order(best_move, terastallize=should_tera)
 
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
@@ -516,6 +669,3 @@ class CustomAgent(Player):
 
     def team_preview(self, battle):
         return self.teampreview(battle)
-
-
-
