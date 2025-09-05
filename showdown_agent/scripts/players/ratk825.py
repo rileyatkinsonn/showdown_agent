@@ -1,5 +1,9 @@
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Any
 from dataclasses import dataclass, field
+import copy
+import random
+import math
+import time
 
 from poke_env.battle import MoveCategory
 from poke_env.battle.abstract_battle import AbstractBattle
@@ -75,6 +79,252 @@ Jolly Nature
 - Close Combat  
 """
 
+@dataclass
+class MCTSNode:
+    """Node in the Monte Carlo Tree Search"""
+    battle_state: Any  # Simplified battle state representation
+    action: Optional[str] = None  # Action that led to this state
+    parent: Optional['MCTSNode'] = None
+    children: List['MCTSNode'] = field(default_factory=list)
+    visits: int = 0
+    wins: float = 0.0
+    
+    def ucb_score(self, exploration_constant: float = 1.4) -> float:
+        """Calculate UCB1 score for node selection"""
+        if self.visits == 0:
+            return float('inf')
+        
+        if not self.parent or self.parent.visits == 0:
+            return self.wins / self.visits
+        
+        exploitation = self.wins / self.visits
+        exploration = math.sqrt(math.log(self.parent.visits) / self.visits)
+        return exploitation + exploration_constant * exploration
+    
+    def add_child(self, action: str, battle_state: Any) -> 'MCTSNode':
+        """Add a child node with given action and state"""
+        child = MCTSNode(
+            battle_state=battle_state,
+            action=action,
+            parent=self
+        )
+        self.children.append(child)
+        return child
+    
+    def is_leaf(self) -> bool:
+        """Check if this is a leaf node"""
+        return len(self.children) == 0
+    
+    def best_child(self) -> Optional['MCTSNode']:
+        """Get child with highest win rate (for final selection)"""
+        if not self.children:
+            return None
+        return max(self.children, key=lambda c: c.wins / c.visits if c.visits > 0 else 0)
+    
+    def uct_select(self, exploration_constant: float = 1.4) -> 'MCTSNode':
+        """Select child using UCB1 algorithm"""
+        if not self.children:
+            return self
+        return max(self.children, key=lambda c: c.ucb_score(exploration_constant))
+    
+    def is_fully_expanded(self) -> bool:
+        """Check if all possible actions have been expanded"""
+        return len(self.children) == len(self.battle_state.get_available_actions())
+    
+    def expand(self) -> 'MCTSNode':
+        """Expand by adding a new child for an unexplored action"""
+        available_actions = self.battle_state.get_available_actions()
+        tried_actions = {child.action for child in self.children}
+        untried_actions = [action for action in available_actions if action not in tried_actions]
+        
+        if not untried_actions:
+            return self
+            
+        action = random.choice(untried_actions)
+        # Pass the agent for better simulation if available
+        agent = getattr(self.battle_state, 'agent', None) 
+        new_state = self.battle_state.simulate_action(action, agent)
+        new_node = MCTSNode(battle_state=new_state, action=action, parent=self)
+        self.children.append(new_node)
+        return new_node
+
+@dataclass 
+class SimplifiedBattleState:
+    """Simplified battle state for MCTS simulation"""
+    our_team: Dict[str, Dict] = field(default_factory=dict)
+    opp_team: Dict[str, Dict] = field(default_factory=dict)
+    our_active: Optional[str] = None
+    opp_active: Optional[str] = None
+    turn_count: int = 0
+    our_side_conditions: Set[str] = field(default_factory=set)
+    opp_side_conditions: Set[str] = field(default_factory=set)
+    winner: Optional[str] = None  # 'us', 'opponent', or None
+    
+    def __init__(self, battle: AbstractBattle = None):
+        if battle:
+            self.our_team = {
+                pokemon.species: {
+                    'hp': pokemon.current_hp_fraction,
+                    'fainted': pokemon.fainted,
+                    'moves': [move.id for move in pokemon.moves.values()],
+                    'types': [str(t) for t in pokemon.types]
+                } 
+                for pokemon in battle.team.values()
+            }
+            self.opp_team = {
+                pokemon.species: {
+                    'hp': pokemon.current_hp_fraction, 
+                    'fainted': pokemon.fainted,
+                    'moves': list(pokemon.moves.keys()) if hasattr(pokemon, 'moves') else [],
+                    'types': [str(t) for t in pokemon.types] if pokemon.types else []
+                }
+                for pokemon in battle.opponent_team.values()
+            }
+            self.our_active = battle.active_pokemon.species if battle.active_pokemon else None
+            self.opp_active = battle.opponent_active_pokemon.species if battle.opponent_active_pokemon else None
+            self.turn_count = battle.turn
+            self.our_side_conditions = set(str(sc) for sc in battle.side_conditions)
+            self.opp_side_conditions = set(str(sc) for sc in battle.opponent_side_conditions)
+    
+    def is_terminal(self) -> bool:
+        """Check if this is a terminal state (battle over)"""
+        if self.winner:
+            return True
+        our_alive = sum(1 for data in self.our_team.values() if not data['fainted'])
+        opp_alive = sum(1 for data in self.opp_team.values() if not data['fainted'])
+        return our_alive == 0 or opp_alive == 0
+    
+    def get_winner(self) -> Optional[str]:
+        """Get winner if terminal state"""
+        if self.winner:
+            return self.winner
+        our_alive = sum(1 for data in self.our_team.values() if not data['fainted'])
+        opp_alive = sum(1 for data in self.opp_team.values() if not data['fainted'])
+        if our_alive == 0:
+            return "opponent"
+        elif opp_alive == 0:
+            return "us"
+        return None
+    
+    def get_available_actions(self) -> List[str]:
+        """Get list of available actions for current player"""
+        actions = []
+        if not self.our_active or self.our_team[self.our_active]['fainted']:
+            # Must switch if no active Pokemon
+            for species, data in self.our_team.items():
+                if not data['fainted'] and species != self.our_active:
+                    actions.append(f"switch_{species}")
+        else:
+            # Add moves
+            for move in self.our_team[self.our_active]['moves']:
+                actions.append(f"move_{move}")
+            # Add switches
+            for species, data in self.our_team.items():
+                if not data['fainted'] and species != self.our_active:
+                    actions.append(f"switch_{species}")
+        return actions if actions else ["struggle"]
+    
+    def simulate_action(self, action: str, agent=None) -> 'SimplifiedBattleState':
+        """Simulate an action using the agent's sophisticated battle analysis"""
+        # Create new state manually to avoid deepcopy issues with async objects
+        new_state = SimplifiedBattleState()
+        new_state.our_team = {k: v.copy() for k, v in self.our_team.items()}
+        new_state.opp_team = {k: v.copy() for k, v in self.opp_team.items()}
+        new_state.our_active = self.our_active
+        new_state.opp_active = self.opp_active
+        new_state.turn_count = self.turn_count + 1
+        new_state.our_side_conditions = self.our_side_conditions.copy()
+        new_state.opp_side_conditions = self.opp_side_conditions.copy()
+        new_state.winner = self.winner
+        # Copy agent reference if it exists
+        if hasattr(self, 'agent'):
+            new_state.agent = self.agent
+        
+        if action.startswith("move_"):
+            move_id = action[5:]
+            # Use realistic damage calculation based on move data
+            if self.opp_active and not new_state.opp_team[self.opp_active]['fainted'] and self.our_active:
+                our_data = new_state.our_team[self.our_active]
+                opp_data = new_state.opp_team[self.opp_active]
+                
+                # Status moves vs attack moves
+                if move_id in ['swordsdance', 'calmmind', 'agility', 'taunt', 'recover', 'thunderwave', 'spikes']:
+                    damage = 0
+                    # Special handling for beneficial moves
+                    if move_id == 'recover' and our_data['hp'] < 1.0:
+                        our_data['hp'] = min(1.0, our_data['hp'] + 0.5)  # Heal 50%
+                else:
+                    # Attack moves - calculate damage based on types
+                    our_types = our_data.get('types', ['NORMAL'])
+                    opp_types = opp_data.get('types', ['NORMAL'])
+                    
+                    # Estimate effectiveness - simplified type chart lookup
+                    effectiveness = 1.0
+                    try:
+                        if agent and hasattr(agent, 'gen_data') and our_types and opp_types:
+                            effectiveness = agent._calculate_type_effectiveness(our_types[0], opp_types)
+                    except:
+                        # Fallback effectiveness based on common matchups
+                        if move_id in ['fireblast', 'flamecharge'] and any('STEEL' in t.upper() or 'GRASS' in t.upper() for t in opp_types):
+                            effectiveness = 2.0
+                        elif move_id in ['closecombat'] and any('STEEL' in t.upper() or 'NORMAL' in t.upper() for t in opp_types):
+                            effectiveness = 2.0
+                        elif move_id in ['psychoboost'] and any('FIGHTING' in t.upper() or 'POISON' in t.upper() for t in opp_types):
+                            effectiveness = 2.0
+                    
+                    # Base damage varies by move power and effectiveness
+                    base_damage = 0.3  # Standard damage
+                    if move_id in ['behemothblade', 'closecombat', 'fireblast', 'dynamaxcannon']:
+                        base_damage = 0.4  # High power moves
+                    elif move_id in ['scaleshot', 'ironhead', 'wildcharge']:
+                        base_damage = 0.35
+                    
+                    damage = base_damage * effectiveness * random.uniform(0.8, 1.2)
+                    damage = min(damage, 0.9)  # Cap damage
+                    
+                new_state.opp_team[self.opp_active]['hp'] = max(0, opp_data['hp'] - damage)
+                if new_state.opp_team[self.opp_active]['hp'] == 0:
+                    new_state.opp_team[self.opp_active]['fainted'] = True
+                    
+            # Opponent counter-attack if still alive
+            if self.opp_active and not new_state.opp_team[self.opp_active]['fainted'] and self.our_active:
+                counter_damage = random.uniform(0.25, 0.4)
+                current_hp = new_state.our_team[self.our_active]['hp']
+                new_state.our_team[self.our_active]['hp'] = max(0, current_hp - counter_damage)
+                if new_state.our_team[self.our_active]['hp'] == 0:
+                    new_state.our_team[self.our_active]['fainted'] = True
+                        
+        elif action.startswith("switch_"):
+            new_active = action[7:]
+            new_state.our_active = new_active
+            # Opponent gets free turn when we switch - use switch punishment
+            if self.opp_active and not new_state.opp_team[self.opp_active]['fainted']:
+                switch_damage = random.uniform(0.3, 0.5)  # Switching is risky
+                new_state.our_team[new_active]['hp'] = max(0, new_state.our_team[new_active]['hp'] - switch_damage)
+                if new_state.our_team[new_active]['hp'] == 0:
+                    new_state.our_team[new_active]['fainted'] = True
+        
+        return new_state
+    
+    def evaluate(self) -> float:
+        """Evaluate position from our perspective (-1 to 1, higher is better)"""
+        if self.is_terminal():
+            winner = self.get_winner()
+            if winner == "us":
+                return 1.0
+            elif winner == "opponent":
+                return -1.0
+                
+        # Heuristic evaluation
+        our_hp = sum(data['hp'] for data in self.our_team.values() if not data['fainted'])
+        opp_hp = sum(data['hp'] for data in self.opp_team.values() if not data['fainted'])
+        our_count = sum(1 for data in self.our_team.values() if not data['fainted'])
+        opp_count = sum(1 for data in self.opp_team.values() if not data['fainted'])
+        
+        hp_advantage = (our_hp - opp_hp) * 0.3
+        count_advantage = (our_count - opp_count) * 0.4
+        
+        return max(-1.0, min(1.0, hp_advantage + count_advantage))
 
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
@@ -84,6 +334,10 @@ class CustomAgent(Player):
         self._last_switched_turn = -2
         self._tera_used = False
         self.gen_data = GenData.from_gen(9)  # Gen 9 type chart and data
+        
+        # MCTS parameters
+        self.mcts_simulations = 20  # Reduced for faster decisions
+        self.mcts_exploration = 1.4  # UCB1 exploration parameter
         
         
         # Constants for decision-making
@@ -712,6 +966,58 @@ class CustomAgent(Player):
             boost = 2 / (2 - mon.boosts[stat])
         return ((2 * mon.base_stats[stat] + 31) + 5) * boost
 
+    def mcts_search(self, battle: AbstractBattle, simulations: int = None) -> str:
+        """Perform MCTS search to find best action"""
+        if simulations is None:
+            simulations = self.mcts_simulations
+            
+        # Create root node from current battle state
+        root_state = SimplifiedBattleState(battle)
+        root_state.agent = self  # Pass agent for sophisticated simulation
+        root = MCTSNode(battle_state=root_state)
+        
+        for _ in range(simulations):
+            # Selection: traverse tree using UCB1
+            node = root
+            while not node.battle_state.is_terminal() and node.is_fully_expanded():
+                node = node.uct_select(self.mcts_exploration)
+            
+            # Expansion: add new child if not terminal
+            if not node.battle_state.is_terminal():
+                node = node.expand()
+            
+            # Simulation: random rollout from current node
+            result = self._simulate_random_rollout(node.battle_state)
+            
+            # Backpropagation: update all nodes in path
+            current = node
+            while current is not None:
+                current.visits += 1
+                current.wins += result
+                current = current.parent
+        
+        # Select best child (highest win rate)
+        best_child = root.best_child()
+        return best_child.action if best_child else "move_struggle"
+    
+    def _simulate_random_rollout(self, state: SimplifiedBattleState, max_depth: int = 10) -> float:
+        """Simulate a random game from the given state until terminal or max depth"""
+        current_state = state
+        depth = 0
+        
+        while not current_state.is_terminal() and depth < max_depth:
+            actions = current_state.get_available_actions()
+            if not actions:
+                break
+                
+            action = random.choice(actions)
+            agent = getattr(current_state, 'agent', None)
+            current_state = current_state.simulate_action(action, agent)
+            depth += 1
+        
+        # Return evaluation from our perspective
+        return (current_state.evaluate() + 1) / 2  # Convert from [-1,1] to [0,1]
+
     def choose_move(self, battle: AbstractBattle):
         if isinstance(battle, DoubleBattle):
             return self.choose_random_doubles_move(battle)
@@ -722,6 +1028,42 @@ class CustomAgent(Player):
 
         if active is None or opponent is None:
             return self.choose_random_move(battle)
+            
+        # Use MCTS for decision making
+        try:
+            best_action = self.mcts_search(battle)
+            print(f"MCTS selected action: {best_action}")
+            return self._convert_mcts_action_to_order(battle, best_action)
+        except Exception as e:
+            print(f"MCTS failed, falling back to heuristics: {e}")
+            # Fallback to original expert system logic if MCTS fails
+            return self._choose_move_fallback(battle)
+    
+    def _convert_mcts_action_to_order(self, battle: AbstractBattle, action: str):
+        """Convert MCTS action string to poke-env order"""
+        if action.startswith("move_"):
+            move_id = action[5:]
+            # Find the actual move object
+            for move in battle.available_moves:
+                if move.id == move_id:
+                    return self.create_order(move)
+            # If move not found, choose random
+            return self.choose_random_move(battle)
+        elif action.startswith("switch_"):
+            species = action[7:]
+            # Find the Pokemon to switch to
+            for pokemon in battle.available_switches:
+                if pokemon.species == species:
+                    return self.create_order(pokemon)
+            # If Pokemon not found, choose random
+            return self.choose_random_move(battle)
+        else:
+            return self.choose_random_move(battle)
+    
+    def _choose_move_fallback(self, battle: AbstractBattle):
+        """Fallback expert system logic if MCTS fails"""
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
 
         # Rough estimation of damage ratio
         physical_ratio = self._stat_estimation(active, "atk") / self._stat_estimation(
