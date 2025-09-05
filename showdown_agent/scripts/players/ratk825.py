@@ -381,6 +381,91 @@ class CustomAgent(Player):
         
         return threat_score
 
+    def _calculate_type_effectiveness(self, attacking_type: str, defending_types: list):
+        """Calculate type effectiveness using GenData type chart"""
+        if not defending_types:
+            return 1.0
+        
+        effectiveness = 1.0
+        attacking_type_upper = str(attacking_type).upper()
+        
+        for defending_type in defending_types:
+            if defending_type:
+                # Handle both PokemonType objects and strings
+                if hasattr(defending_type, 'name'):
+                    # PokemonType object - use .name attribute
+                    defending_type_upper = defending_type.name.upper()
+                else:
+                    # String - convert directly
+                    defending_type_upper = str(defending_type).upper()
+                
+                # GenData type chart structure: defending_type -> attacking_type -> multiplier
+                type_multiplier = self.gen_data.type_chart.get(defending_type_upper, {}).get(attacking_type_upper, 1.0)
+                effectiveness *= type_multiplier
+        
+        return effectiveness
+
+    def _evaluate_tera_options(self, pokemon, battle: AbstractBattle):
+        """Evaluate which Tera type would be most effective"""
+        available_types = ["NORMAL", "FIRE", "WATER", "ELECTRIC", "GRASS", "ICE", 
+                          "FIGHTING", "POISON", "GROUND", "FLYING", "PSYCHIC", 
+                          "BUG", "ROCK", "GHOST", "DRAGON", "DARK", "STEEL", "FAIRY"]
+        
+        best_tera = None
+        best_score = -999
+        
+        # Get opponent threats
+        opponent_team = [p for p in battle.opponent_team.values() if p and not p.fainted]
+        
+        for tera_type in available_types:
+            score = 0
+            
+            # Offensive benefit: How well does this type hit opponent team?
+            for opp_pokemon in opponent_team:
+                effectiveness = self._calculate_type_effectiveness(tera_type.lower(), opp_pokemon.types)
+                score += (effectiveness - 1.0) * 2  # Bonus for super effective
+            
+            # Defensive benefit: How well does this type resist opponent attacks?
+            for opp_pokemon in opponent_team:
+                for opp_type in opp_pokemon.types:
+                    if opp_type:
+                        resistance = self._calculate_type_effectiveness(str(opp_type), [tera_type.lower()])
+                        score += (1.0 - resistance)  # Bonus for resisting
+            
+            # Prefer current Tera type slightly (avoid waste)
+            if hasattr(pokemon, 'tera_type') and pokemon.tera_type and tera_type.lower() == pokemon.tera_type.lower():
+                score += 0.5
+            
+            if score > best_score:
+                best_score = score
+                best_tera = tera_type.lower()
+        
+        return best_tera, best_score
+
+    def _find_coverage_gaps(self, battle: AbstractBattle):
+        """Find opponent Pokemon we have poor coverage against"""
+        coverage_gaps = []
+        
+        for opp_pokemon in battle.opponent_team.values():
+            if not opp_pokemon or opp_pokemon.fainted:
+                continue
+                
+            best_effectiveness = 0
+            for our_pokemon in battle.team.values():
+                if our_pokemon.fainted:
+                    continue
+                    
+                for our_type in our_pokemon.types:
+                    if our_type:
+                        effectiveness = self._calculate_type_effectiveness(str(our_type), opp_pokemon.types)
+                        best_effectiveness = max(best_effectiveness, effectiveness)
+            
+            # If our best coverage is not very effective or worse
+            if best_effectiveness <= 0.5:
+                coverage_gaps.append((opp_pokemon, best_effectiveness))
+        
+        return coverage_gaps
+
     def _analyze_opponent_team(self, battle: AbstractBattle):
         threats = []
         for species, pokemon in battle.opponent_team.items():
@@ -429,25 +514,32 @@ class CustomAgent(Player):
 
     def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
         if battle.can_tera:
-            # Last full HP mon
-            if (
-                    len([m for m in battle.team.values() if m.current_hp_fraction == 1])
-                    == 1
-                    and battle.active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            # Matchup advantage and full hp on full hp
-            if (
-                    self._estimate_matchup(
-                        battle.active_pokemon, battle.opponent_active_pokemon
-                    )
-                    > 0
-                    and battle.active_pokemon.current_hp_fraction == 1
-                    and battle.opponent_active_pokemon.current_hp_fraction == 1
-            ):
-                return True
-            if n_remaining_mons == 1:
-                return True
+            active = battle.active_pokemon
+            
+            # Evaluate optimal Tera type
+            best_tera, tera_score = self._evaluate_tera_options(active, battle)
+            
+            # Use Tera if we get significant benefit (score > 1.0)
+            if tera_score > 1.0:
+                # Last full HP mon
+                if (
+                        len([m for m in battle.team.values() if m.current_hp_fraction == 1])
+                        == 1
+                        and active.current_hp_fraction == 1
+                ):
+                    return True
+                # Significant type advantage gained
+                if tera_score > 2.0 and active.current_hp_fraction > 0.5:
+                    return True
+                # Matchup advantage and full hp on full hp
+                if (
+                        self._estimate_matchup(active, battle.opponent_active_pokemon) > 0
+                        and active.current_hp_fraction == 1
+                        and battle.opponent_active_pokemon.current_hp_fraction == 1
+                ):
+                    return True
+                if n_remaining_mons == 1:
+                    return True
         return False
 
     def _should_switch_out(self, battle: AbstractBattle):
