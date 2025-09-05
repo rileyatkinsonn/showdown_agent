@@ -493,6 +493,11 @@ class CustomAgent(Player):
             # Enhanced move selection with endgame/momentum consideration
             move_scores = []
             for m in battle.available_moves:
+                # Skip completely ineffective moves (0x damage)
+                type_effectiveness = opponent.damage_multiplier(m)
+                if type_effectiveness == 0:
+                    continue
+                    
                 base_score = (m.base_power
                               * (1.5 if m.type in active.types else 1)
                               * (
@@ -502,7 +507,7 @@ class CustomAgent(Player):
                               )
                               * m.accuracy
                               * m.expected_hits
-                              * opponent.damage_multiplier(m))
+                              * type_effectiveness)
                 
                 # Boost aggressive moves in endgame/momentum situations
                 if endgame['win_urgency'] >= 2 or momentum['momentum_score'] >= 2:
@@ -521,6 +526,10 @@ class CustomAgent(Player):
                         base_score *= 1.4
                 
                 move_scores.append((m, base_score))
+            
+            # Fallback if all moves are ineffective (shouldn't happen in normal play)
+            if not move_scores:
+                move_scores = [(m, 1) for m in battle.available_moves]
             
             best_move = max(move_scores, key=lambda x: x[1])[0]
             
