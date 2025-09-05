@@ -119,6 +119,20 @@ class CustomAgent(Player):
 
         return score
 
+    def _evaluate_hazard_pressure(self, battle: AbstractBattle):
+        """Evaluate how much hazard damage is affecting our team"""
+        our_hazards = len(battle.side_conditions)
+        their_hazards = len(battle.opponent_side_conditions)
+        
+        # Count how many of our team are hurt by hazards
+        vulnerable_count = 0
+        for pokemon in battle.team.values():
+            if not pokemon.fainted and pokemon.current_hp_fraction < 0.8:
+                vulnerable_count += 1
+        
+        hazard_pressure = our_hazards * 2 + vulnerable_count
+        return hazard_pressure
+
     def _analyze_opponent_team(self, battle: AbstractBattle):
         threats = []
         for species, pokemon in battle.opponent_team.items():
@@ -332,6 +346,44 @@ class CustomAgent(Player):
 
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
+            
+            # Hazard management: prioritize Pokemon that can handle hazard pressure
+            hazard_pressure = self._evaluate_hazard_pressure(battle)
+            
+            if hazard_pressure >= 4:  # High hazard pressure
+                # Prioritize switching to Pokemon with:
+                # 1. High HP (can tank hazard damage)
+                # 2. Good defensive stats
+                # 3. Recovery moves or defensive utility
+                
+                hazard_resistant = []
+                for switch in switches:
+                    resistance_score = 0
+                    
+                    # High HP Pokemon handle hazards better
+                    if switch.current_hp_fraction >= 0.8:
+                        resistance_score += 2
+                    
+                    # Defensive Pokemon (Arceus-Fairy) are better hazard absorbers
+                    if switch.species == 'arceusfairy':
+                        resistance_score += 3
+                    elif switch.species in ['eternatus', 'kingambit']:  # Bulky Pokemon
+                        resistance_score += 1
+                    
+                    # Check if they have recovery moves
+                    for move_id in switch.moves:
+                        if move_id in self.RECOVERY_MOVES:
+                            resistance_score += 2
+                            break
+                    
+                    hazard_resistant.append((switch, resistance_score))
+                
+                if hazard_resistant:
+                    # Sort by resistance score, then by matchup
+                    best_resistant = max(hazard_resistant, 
+                                       key=lambda x: (x[1], self._estimate_matchup(x[0], opponent)))
+                    if best_resistant[1] >= 2:  # Good resistance score
+                        return self.create_order(best_resistant[0])
             
             # Enhanced switch selection considering opponent team
             predicted_switch = self._predict_opponent_switch(battle)
