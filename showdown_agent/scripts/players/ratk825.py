@@ -369,10 +369,16 @@ class CustomAgent(Player):
 
     def teampreview(self, battle):
         team_list = list(battle.team.values())
-        preferred = ['deoxysspeed', 'kingambit', 'zaciancrowned']
-        for i, p in enumerate(team_list):
-            if p.species in preferred:
-                return f"/team {i + 1}"
+        
+        # Safer lead priority: Zacian (versatile) > Kingambit (trades well) > Deoxys (risky but rewarding)
+        lead_priority = ['zaciancrowned', 'kingambit', 'deoxysspeed']
+        
+        for preferred_lead in lead_priority:
+            for i, pokemon in enumerate(team_list):
+                if pokemon.species == preferred_lead:
+                    return f"/team {i + 1}"
+        
+        # Fallback to first Pokemon
         return "/team 1"
 
     # poke-env alt names
