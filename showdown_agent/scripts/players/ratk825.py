@@ -276,11 +276,117 @@ class CustomAgent(Player):
             'opportunities': opportunities
         }
 
+    def _get_move_data(self, move_id: str):
+        """Get detailed move data from GenData"""
+        move_data = self.gen_data.moves.get(move_id, {})
+        
+        # Handle heal field which can be a number or list
+        heal_data = move_data.get('heal', 0)
+        heal_amount = heal_data[0] if isinstance(heal_data, list) else heal_data
+        
+        # Handle recoil field which can be a number or list  
+        recoil_data = move_data.get('recoil', 0)
+        recoil_amount = abs(recoil_data[0]) if isinstance(recoil_data, list) else abs(recoil_data) if recoil_data else 0
+        
+        return {
+            'priority': move_data.get('priority', 0),
+            'has_secondary': bool(move_data.get('secondary', False)),
+            'heal': heal_amount,
+            'recoil': recoil_amount,
+            'status_chance': move_data.get('secondary', {}).get('chance', 0) if move_data.get('secondary') else 0,
+            'target': move_data.get('target', 'normal'),
+            'flags': move_data.get('flags', {}),
+            'base_power': move_data.get('basePower', 0)
+        }
+
+    def _analyze_move_value(self, move, battle: AbstractBattle):
+        """Enhanced move analysis using GenData"""
+        move_data = self._get_move_data(move.id)
+        value_score = 0
+        
+        # Priority moves are valuable for revenge killing
+        if move_data['priority'] > 0:
+            # Check if opponent is in KO range
+            if battle.opponent_active_pokemon.current_hp_fraction < 0.4:
+                value_score += 2
+        
+        # Status moves with good secondary effects
+        if move_data['has_secondary'] and move_data['status_chance'] >= 30:
+            value_score += 1
+        
+        # Healing moves are valuable when low HP
+        if move_data['heal'] > 0 and battle.active_pokemon.current_hp_fraction < 0.5:
+            value_score += move_data['heal'] / 25  # Scale healing value
+        
+        # Penalize recoil moves when low HP
+        if move_data['recoil'] and battle.active_pokemon.current_hp_fraction < 0.3:
+            value_score -= 1
+        
+        # Multi-target moves less valuable in singles
+        if move_data['target'] in ['allAdjacent', 'allAdjacentFoes']:
+            value_score -= 0.5
+        
+        return value_score
+
+    def _get_pokemon_data(self, species: str):
+        """Get detailed Pokemon data from GenData"""
+        # Handle form variations (e.g., 'zaciancrowned' -> 'zacian')
+        base_species = species.lower().replace('-', '').replace('_', '')
+        
+        pokemon_data = self.gen_data.pokedex.get(base_species, {})
+        if not pokemon_data and 'crowned' in base_species:
+            pokemon_data = self.gen_data.pokedex.get(base_species.replace('crowned', ''), {})
+        
+        return {
+            'base_stats': pokemon_data.get('baseStats', {}),
+            'types': pokemon_data.get('types', []),
+            'abilities': pokemon_data.get('abilities', {}),
+            'weight': pokemon_data.get('weightkg', 0),
+            'tier': pokemon_data.get('tier', 'Unknown')
+        }
+
+    def _enhanced_threat_assessment(self, pokemon, battle: AbstractBattle):
+        """Enhanced threat assessment using GenData"""
+        threat_score = 0
+        pokemon_data = self._get_pokemon_data(pokemon.species)
+        
+        # High base attack/special attack Pokemon are threats
+        base_stats = pokemon_data['base_stats']
+        if base_stats:
+            max_offensive_stat = max(base_stats.get('atk', 0), base_stats.get('spa', 0))
+            if max_offensive_stat >= 130:  # Uber-tier offensive stats
+                threat_score += 2
+            elif max_offensive_stat >= 110:
+                threat_score += 1
+            
+            # High speed is dangerous
+            speed = base_stats.get('spe', 0)
+            if speed >= 100:
+                threat_score += 1
+        
+        # Check if Pokemon has dangerous abilities
+        abilities = pokemon_data['abilities']
+        dangerous_abilities = ['supremeoverlord', 'intrepidsword', 'orichalcumpulse']
+        if any(ability in abilities.values() for ability in dangerous_abilities):
+            threat_score += 1
+        
+        # Factor in current HP and boosts
+        if pokemon.current_hp_fraction > 0.8:
+            threat_score += 1
+        
+        # Check for stat boosts
+        if pokemon.boosts:
+            offensive_boosts = pokemon.boosts.get('atk', 0) + pokemon.boosts.get('spa', 0)
+            threat_score += max(0, offensive_boosts)
+        
+        return threat_score
+
     def _analyze_opponent_team(self, battle: AbstractBattle):
         threats = []
         for species, pokemon in battle.opponent_team.items():
             if pokemon and not pokemon.fainted:
-                threat_level = 0
+                # Use enhanced threat assessment
+                threat_level = self._enhanced_threat_assessment(pokemon, battle)
                 
                 # Check revealed moves for threat assessment
                 for move_id in pokemon.moves:
@@ -508,6 +614,10 @@ class CustomAgent(Player):
                               * m.accuracy
                               * m.expected_hits
                               * type_effectiveness)
+                
+                # Add move value analysis from GenData
+                move_value = self._analyze_move_value(m, battle)
+                base_score += move_value * 10  # Scale the bonus appropriately
                 
                 # Boost aggressive moves in endgame/momentum situations
                 if endgame['win_urgency'] >= 2 or momentum['momentum_score'] >= 2:
