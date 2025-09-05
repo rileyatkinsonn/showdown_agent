@@ -85,6 +85,7 @@ class CustomAgent(Player):
         self._tera_used = False
         self.gen_data = GenData.from_gen(9)  # Gen 9 type chart and data
         
+        
         # Constants for decision-making
         self.ENTRY_HAZARDS = {
             "spikes": SideCondition.SPIKES,
@@ -96,6 +97,12 @@ class CustomAgent(Player):
         self.SPEED_TIER_COEFICIENT = 0.1
         self.HP_FRACTION_COEFICIENT = 0.4
         self.SWITCH_OUT_MATCHUP_THRESHOLD = -2.0
+        
+        # Threat categories
+        self.SETUP_MOVES = {"swordsdance", "calmmind", "agility", "dragondance", "nastyplot"}
+        self.PRIORITY_MOVES = {"suckerpunch", "extremespeed", "quickattack", "bulletpunch"}
+        self.HAZARD_MOVES = {"spikes", "stealthrock", "toxicspikes", "stickyweb"}
+        self.RECOVERY_MOVES = {"recover", "roost", "moonlight", "synthesis", "morningsun"}
 
     def _estimate_matchup(self, mon: Pokemon, opponent: Pokemon):
         score = max([opponent.damage_multiplier(t) for t in mon.types if t is not None])
@@ -111,6 +118,51 @@ class CustomAgent(Player):
         score -= opponent.current_hp_fraction * self.HP_FRACTION_COEFICIENT
 
         return score
+
+    def _analyze_opponent_team(self, battle: AbstractBattle):
+        threats = []
+        for species, pokemon in battle.opponent_team.items():
+            if pokemon and not pokemon.fainted:
+                threat_level = 0
+                
+                # Check revealed moves for threat assessment
+                for move_id in pokemon.moves:
+                    if move_id in self.SETUP_MOVES:
+                        threat_level += 2
+                    elif move_id in self.PRIORITY_MOVES:
+                        threat_level += 1
+                    elif move_id in self.RECOVERY_MOVES:
+                        threat_level += 1
+                
+                # Type matchup vs our team
+                our_team_matchups = []
+                for our_mon in battle.team.values():
+                    if not our_mon.fainted:
+                        matchup = self._estimate_matchup(our_mon, pokemon)
+                        our_team_matchups.append(matchup)
+                
+                if our_team_matchups:
+                    avg_matchup = sum(our_team_matchups) / len(our_team_matchups)
+                    if avg_matchup < -1:  # Opponent has advantage vs our team
+                        threat_level += 2
+                
+                threats.append((pokemon, threat_level))
+        
+        return sorted(threats, key=lambda x: x[1], reverse=True)
+
+    def _predict_opponent_switch(self, battle: AbstractBattle):
+        active = battle.active_pokemon
+        opponent = battle.opponent_active_pokemon
+        
+        # If opponent is in a bad matchup, predict switch
+        if self._estimate_matchup(active, opponent) > 1.5:
+            # Look for best switch target
+            threats = self._analyze_opponent_team(battle)
+            for threat_pokemon, threat_level in threats:
+                if (threat_pokemon.species != opponent.species and 
+                    self._estimate_matchup(active, threat_pokemon) < 0):
+                    return threat_pokemon
+        return None
 
     def _should_tera(self, battle: AbstractBattle, n_remaining_mons: int):
         if battle.can_tera:
@@ -138,6 +190,10 @@ class CustomAgent(Player):
     def _should_switch_out(self, battle: AbstractBattle):
         active = battle.active_pokemon
         opponent = battle.opponent_active_pokemon
+        
+        # Enhanced switch logic considering opponent threats
+        predicted_switch = self._predict_opponent_switch(battle)
+        
         # If there is a decent switch in...
         if [
             m
@@ -157,6 +213,21 @@ class CustomAgent(Player):
                     and active.stats["atk"] <= active.stats["spa"]
             ):
                 return True
+            
+            # Enhanced switching: consider opponent setup potential
+            for move_id in opponent.moves:
+                if move_id in self.SETUP_MOVES and opponent.current_hp_fraction > 0.7:
+                    return True
+            
+            # Consider predicted opponent switch
+            if predicted_switch:
+                best_vs_predicted = max([
+                    self._estimate_matchup(m, predicted_switch) 
+                    for m in battle.available_switches
+                ], default=-999)
+                if best_vs_predicted > 0.5:
+                    return True
+            
             if (
                     self._estimate_matchup(active, opponent)
                     < self.SWITCH_OUT_MATCHUP_THRESHOLD
@@ -219,10 +290,14 @@ class CustomAgent(Player):
                 ):
                     return self.create_order(move)
 
-            # Setup moves
+            # Enhanced setup logic considering opponent team
+            threats = self._analyze_opponent_team(battle)
+            high_threat_count = sum(1 for _, threat_level in threats if threat_level >= 2)
+            
             if (
                     active.current_hp_fraction == 1
                     and self._estimate_matchup(active, opponent) > 0
+                    and high_threat_count <= 2  # Don't setup if too many threats remain
             ):
                 for move in battle.available_moves:
                     if (
@@ -234,7 +309,11 @@ class CustomAgent(Player):
                     )
                             < 6
                     ):
-                        return self.create_order(move)
+                        # Extra check: don't setup if opponent has priority moves
+                        has_priority = any(move_id in self.PRIORITY_MOVES 
+                                         for move_id in opponent.moves)
+                        if not has_priority or active.current_hp_fraction > 0.8:
+                            return self.create_order(move)
 
             move = max(
                 battle.available_moves,
@@ -253,6 +332,32 @@ class CustomAgent(Player):
 
         if battle.available_switches:
             switches: List[Pokemon] = battle.available_switches
+            
+            # Enhanced switch selection considering opponent team
+            predicted_switch = self._predict_opponent_switch(battle)
+            
+            if predicted_switch:
+                # Switch to counter predicted opponent switch
+                best_vs_predicted = max(
+                    switches,
+                    key=lambda s: self._estimate_matchup(s, predicted_switch)
+                )
+                if self._estimate_matchup(best_vs_predicted, predicted_switch) > 0:
+                    return self.create_order(best_vs_predicted)
+            
+            # Consider overall threat level of opponent team
+            threats = self._analyze_opponent_team(battle)
+            if threats:
+                # Switch to handle biggest threat
+                biggest_threat = threats[0][0]
+                best_vs_threat = max(
+                    switches,
+                    key=lambda s: self._estimate_matchup(s, biggest_threat)
+                )
+                if self._estimate_matchup(best_vs_threat, biggest_threat) > 0:
+                    return self.create_order(best_vs_threat)
+            
+            # Default: best matchup vs current opponent
             return self.create_order(
                 max(
                     switches,
