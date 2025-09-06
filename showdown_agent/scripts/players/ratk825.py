@@ -10,6 +10,16 @@ from poke_env.player.battle_order import BattleOrder
 from poke_env.player.player import Player
 from poke_env.data import GenData
 
+# Utility functions
+def _norm_species(s: str) -> str:
+    return (s or "").lower().replace("-", "")
+
+def _move_ids_from_pokemon(p: Pokemon) -> Set[str]:
+    # p.moves is a dict move_id -> Move; revealed moves show up here
+    if not p or not getattr(p, "moves", None):
+        return set()
+    return set(p.moves.keys())
+
 team = """
 Deoxys-Speed @ Focus Sash  
 Ability: Pressure  
@@ -155,44 +165,91 @@ class OpponentTracker:
         self.last_active_pokemon: Optional[str] = None
 
     def add_pokemon(self, species: str, pokemon: Pokemon = None):
-        """Add a new Pokemon to our knowledge"""
-        if species not in self.known_pokemon:
-            types = [t.name.lower() for t in pokemon.types] if pokemon and pokemon.types else []
-            self.known_pokemon[species] = OpponentPokemon(
+        key = _norm_species(species)
+        if key not in self.known_pokemon:
+            types = [t.name.lower() for t in (pokemon.types or [])] if pokemon else []
+            moves_seen = _move_ids_from_pokemon(pokemon)
+            ability = getattr(pokemon, "ability", None)
+            ability = ability.name if hasattr(ability, "name") else (str(ability).lower() if ability else None)
+            item = getattr(pokemon, "item", None)
+            item = item.name if hasattr(item, "name") else (str(item).lower() if item else None)
+
+            self.known_pokemon[key] = OpponentPokemon(
                 species=species,
                 types=types,
+                moves_seen=moves_seen,
+                ability=ability,
+                item=item,
                 current_hp_fraction=pokemon.current_hp_fraction if pokemon else 1.0,
                 is_alive=not pokemon.fainted if pokemon else True,
-                status=pokemon.status.name if pokemon and pokemon.status else None
+                status=pokemon.status.name if (pokemon and pokemon.status) else None
             )
 
+    def bootstrap_from_preview(self, battle: AbstractBattle):
+        """Call once per battle start; pull entire opponent_team into known_pokemon."""
+        if hasattr(battle, "opponent_team") and battle.opponent_team:
+            for species, p in battle.opponent_team.items():
+                self.add_pokemon(species, p)
+                self.team_preview_seen.add(species)
+
+    def sync_from_battle(self, battle: AbstractBattle):
+        """Call every turn; refresh HP/faint/status/types/moves for ALL opponent mons."""
+        if not hasattr(battle, "opponent_team") or not battle.opponent_team:
+            return
+        for species, p in battle.opponent_team.items():
+            key = _norm_species(species)
+            # Ensure it's registered
+            self.add_pokemon(species, p)
+            opp_mon = self.known_pokemon[key]
+
+            # Update "static-ish" facts we might have learned
+            opp_mon.is_alive = not p.fainted
+            opp_mon.update_hp(p.current_hp_fraction)
+            opp_mon.status = p.status.name if p.status else None
+            if p.types:
+                opp_mon.types = [t.name.lower() for t in p.types]
+
+            # Ability / item (if revealed)
+            ability = getattr(p, "ability", None)
+            if ability and not opp_mon.ability:
+                opp_mon.ability = ability.name if hasattr(ability, "name") else str(ability).lower()
+            item = getattr(p, "item", None)
+            if item and not opp_mon.item:
+                opp_mon.item = item.name if hasattr(item, "name") else str(item).lower()
+
+            # **CRITICAL**: sync revealed moves every turn
+            opp_mon.moves_seen |= _move_ids_from_pokemon(p)
+
     def update_pokemon(self, species: str, pokemon: Pokemon):
-        """Update known info about a Pokemon"""
-        if species not in self.known_pokemon:
+        key = _norm_species(species)
+        if key not in self.known_pokemon:
             self.add_pokemon(species, pokemon)
+        opp_mon = self.known_pokemon[key]
+
+        # detect switch
+        if self.last_active_pokemon and self.last_active_pokemon != key:
+            opp_mon.record_switch_in()
+            self.profile.update_switching(True)
         else:
-            opp_mon = self.known_pokemon[species]
+            self.profile.update_switching(False)
 
-            # Check if this is a switch
-            if self.last_active_pokemon and self.last_active_pokemon != species:
-                opp_mon.record_switch_in()
-                self.profile.update_switching(True)
-            else:
-                self.profile.update_switching(False)
+        opp_mon.update_hp(pokemon.current_hp_fraction)
+        opp_mon.is_alive = not pokemon.fainted
+        opp_mon.status = pokemon.status.name if pokemon.status else None
+        if pokemon.types:
+            opp_mon.types = [t.name.lower() for t in pokemon.types]
 
-            opp_mon.update_hp(pokemon.current_hp_fraction)
-            opp_mon.is_alive = not pokemon.fainted
-            opp_mon.status = pokemon.status.name if pokemon.status else None
-            if pokemon.types:
-                opp_mon.types = [t.name.lower() for t in pokemon.types]
+        # sync revealed moves for this active mon
+        opp_mon.moves_seen |= _move_ids_from_pokemon(pokemon)
 
-            opp_mon.record_turn_active()
-            self.last_active_pokemon = species
+        opp_mon.record_turn_active()
+        self.last_active_pokemon = key
 
     def log_move_used(self, species: str, move_id: str, was_risky: bool = False, was_setup: bool = False):
         """Record that we saw this Pokemon use this move"""
-        if species in self.known_pokemon:
-            self.known_pokemon[species].add_move(move_id)
+        key = _norm_species(species)
+        if key in self.known_pokemon:
+            self.known_pokemon[key].add_move(move_id)
 
             if was_setup:
                 self.profile.record_setup_move()
@@ -210,12 +267,16 @@ class OpponentTracker:
         """Get number of opponent Pokemon still alive"""
         return sum(1 for mon in self.known_pokemon.values() if mon.is_alive)
 
+    def get_moves_seen(self, species: str) -> Set[str]:
+        mon = self.known_pokemon.get(_norm_species(species))
+        return mon.moves_seen.copy() if mon else set()
+
     def get_switch_pattern_score(self, current_species: str) -> float:
         """Analyze opponent's switching patterns for this Pokemon"""
-        if current_species not in self.known_pokemon:
+        mon = self.known_pokemon.get(_norm_species(current_species))
+        if not mon:
             return 0.5
 
-        mon = self.known_pokemon[current_species]
         if mon.turns_active == 0:
             return 0.5
 
@@ -259,10 +320,10 @@ class OpponentTracker:
 
     def predict_move_choice(self, current_species: str, available_moves: List[str], our_pokemon: Pokemon) -> Dict[str, float]:
         """Predict what move the opponent is likely to use"""
-        if current_species not in self.known_pokemon:
+        mon = self.known_pokemon.get(_norm_species(current_species))
+        if not mon:
             return {move: 1.0 / len(available_moves) for move in available_moves}
 
-        mon = self.known_pokemon[current_species]
         predictions = {}
 
         for move in available_moves:
@@ -492,7 +553,7 @@ class CustomAgent(Player):
         responses = {}
         
         # Get opponent's known moves and behavioral patterns
-        known_pokemon = self.opponent_tracker.known_pokemon.get(opponent.species)
+        known_pokemon = self.opponent_tracker.known_pokemon.get(_norm_species(opponent.species))
         if not known_pokemon:
             # No data yet - use species defaults
             return self._get_default_opponent_responses(opponent.species, our_move)
@@ -543,7 +604,7 @@ class CustomAgent(Player):
     
     def _get_default_opponent_responses(self, species: str, our_move) -> Dict[str, float]:
         """Default responses when we have no learned data"""
-        species_lower = species.lower().replace('-', '')
+        species_lower = _norm_species(species)
         
         # Species-specific response patterns
         if 'kingambit' in species_lower:
@@ -581,8 +642,9 @@ class CustomAgent(Player):
                 switch_penalty = 0.2  # General switching penalty
                 if 'switch_to_' in response:
                     switch_target = response.replace('switch_to_', '')
-                    if switch_target in self.opponent_tracker.known_pokemon:
-                        switch_types = self.opponent_tracker.known_pokemon[switch_target].types
+                    switch_key = _norm_species(switch_target)
+                    if switch_key in self.opponent_tracker.known_pokemon:
+                        switch_types = self.opponent_tracker.known_pokemon[switch_key].types
                         if switch_types:
                             # Check if their switch-in resists our move
                             effectiveness = self._get_type_effectiveness(move.type.name, switch_types)
@@ -708,19 +770,6 @@ class CustomAgent(Player):
         else:
             self._opp_last_boosts = {}
     
-    def _learn_from_team_preview(self, battle: AbstractBattle):
-        """Learn opponent's team composition during team preview/early battle"""
-        if hasattr(battle, 'opponent_team') and battle.opponent_team:
-            for species, pokemon in battle.opponent_team.items():
-                self.opponent_tracker.add_pokemon(species, pokemon)
-                self.opponent_tracker.team_preview_seen.add(species)
-                
-        # Also learn from any visible opponent Pokemon
-        if battle.opponent_active_pokemon:
-            species = battle.opponent_active_pokemon.species
-            if species not in self.opponent_tracker.known_pokemon:
-                self.opponent_tracker.add_pokemon(species, battle.opponent_active_pokemon)
-    
     def _infer_opponent_move_type(self, species: str, move_type: str):
         """Record inferred move usage with enhanced categorization"""
         was_risky = False
@@ -750,7 +799,7 @@ class CustomAgent(Player):
     
     def _predict_likely_moves(self, opponent_species: str, our_active: Pokemon) -> Dict[str, float]:
         """Predict what moves opponent is likely to use based on learned data and current situation"""
-        known_pokemon = self.opponent_tracker.known_pokemon.get(opponent_species)
+        known_pokemon = self.opponent_tracker.known_pokemon.get(_norm_species(opponent_species))
         
         if not known_pokemon or not known_pokemon.moves_seen:
             return self._get_default_move_predictions(opponent_species, our_active)
@@ -782,7 +831,7 @@ class CustomAgent(Player):
     
     def _get_default_move_predictions(self, species: str, our_active: Pokemon) -> Dict[str, float]:
         """Default move predictions for unknown Pokemon based on species and situation"""
-        species_lower = species.lower().replace('-', '')
+        species_lower = _norm_species(species)
         
         # Species-specific predictions based on common Uber strategies
         if 'deoxysspeed' in species_lower:
@@ -844,8 +893,9 @@ class CustomAgent(Player):
         best_matchup_score = -999
         
         # Check all known opponent Pokemon
-        for species, pokemon_data in self.opponent_tracker.known_pokemon.items():
-            if not pokemon_data.is_alive or species == current_opponent.species:
+        current_opponent_key = _norm_species(current_opponent.species)
+        for species_key, pokemon_data in self.opponent_tracker.known_pokemon.items():
+            if not pokemon_data.is_alive or species_key == current_opponent_key:
                 continue  # Skip fainted or currently active Pokemon
                 
             # Estimate how good this matchup would be for them
@@ -857,7 +907,7 @@ class CustomAgent(Player):
             
             if type_advantage > best_matchup_score:
                 best_matchup_score = type_advantage
-                best_counter = species
+                best_counter = pokemon_data.species
                 
         return best_counter
 
@@ -892,16 +942,15 @@ class CustomAgent(Player):
         if active is None or opponent is None:
             return self.choose_random_move(battle)
 
+        # keep opponent knowledge always fresh
+        self.opponent_tracker.sync_from_battle(battle)
+
         # ACTIVE LEARNING: Parse battle events and update tracking
         self._parse_battle_events(battle)
 
         # Update opponent tracking with current Pokemon data
         if opponent:
             self.opponent_tracker.update_pokemon(opponent.species, opponent)
-
-        # Learn from team preview if first turn
-        if self.turn_count == 1:
-            self._learn_from_team_preview(battle)
             
         # Validate our predictions from last turn and update learning
         if self.turn_count > 1 and opponent:
@@ -918,8 +967,8 @@ class CustomAgent(Player):
         # CRITICAL FIX: Better lead selection and early game strategy  
         if self.turn_count == 1:
             # Learn their lead patterns for future battles
-            active_clean = active.species.lower().replace('-', '')
-            opponent_clean = opponent.species.lower().replace('-', '')
+            active_clean = _norm_species(active.species)
+            opponent_clean = _norm_species(opponent.species)
             battle_id = getattr(battle, 'battle_tag', str(id(battle)))
             
             # Track opponent's lead (only once per battle)
@@ -934,7 +983,7 @@ class CustomAgent(Player):
                 # Don't let them get free spikes - switch to our Deoxys
                 available_switches = battle.available_switches
                 if available_switches:
-                    deoxys_switches = [p for p in available_switches if 'deoxysspeed' in p.species.lower()]
+                    deoxys_switches = [p for p in available_switches if _norm_species(p.species) == 'deoxysspeed']
                     if deoxys_switches:
                         return self.create_order(deoxys_switches[0])
                         
@@ -942,7 +991,7 @@ class CustomAgent(Player):
                 # Don't lead Kingambit vs Close Combat users
                 available_switches = battle.available_switches  
                 if available_switches:
-                    safe_switches = [p for p in available_switches if p.species.lower().replace('-', '') in ['arceusfairy', 'eternatus']]
+                    safe_switches = [p for p in available_switches if _norm_species(p.species) in ['arceusfairy', 'eternatus']]
                     if safe_switches:
                         return self.create_order(safe_switches[0])
 
@@ -960,32 +1009,34 @@ class CustomAgent(Player):
                 
                 if switch_probability > 0.7:  # Very likely to switch
                     predicted_switch = self._predict_best_switch_in(battle)
-                    if predicted_switch and predicted_switch in self.opponent_tracker.known_pokemon:
-                        switch_types = self.opponent_tracker.known_pokemon[predicted_switch].types
-                        if switch_types:
-                            # Find moves that are super effective vs predicted switch
-                            prediction_moves = []
-                            for move in battle.available_moves:
-                                effectiveness = self._get_type_effectiveness(move.type.name, switch_types)
-                                if effectiveness >= 2.0:  # Super effective
-                                    prediction_value = move.base_power * effectiveness * 1.5  # STAB bonus
-                                    prediction_moves.append((move, prediction_value))
-                            
-                            if prediction_moves:
-                                best_prediction = max(prediction_moves, key=lambda x: x[1])
-                                prediction_move, prediction_value = best_prediction
+                    if predicted_switch:
+                        predicted_key = _norm_species(predicted_switch)
+                        if predicted_key in self.opponent_tracker.known_pokemon:
+                            switch_types = self.opponent_tracker.known_pokemon[predicted_key].types
+                            if switch_types:
+                                # Find moves that are super effective vs predicted switch
+                                prediction_moves = []
+                                for move in battle.available_moves:
+                                    effectiveness = self._get_type_effectiveness(move.type.name, switch_types)
+                                    if effectiveness >= 2.0:  # Super effective
+                                        prediction_value = move.base_power * effectiveness * 1.5  # STAB bonus
+                                        prediction_moves.append((move, prediction_value))
                                 
-                                # Compare with minimax evaluation of normal moves
-                                best_normal_value = max(
-                                    self._minimax_evaluate_move(m, active, opponent, battle, depth=1) 
-                                    for m in battle.available_moves
-                                )
-                                
-                                # Only use prediction if it's significantly better
-                                if prediction_value > best_normal_value * 1.3:
-                                    self.predictions_made += 1
-                                    self._predicted_switch_last_turn = True
-                                    return self.create_order(prediction_move)
+                                if prediction_moves:
+                                    best_prediction = max(prediction_moves, key=lambda x: x[1])
+                                    prediction_move, prediction_value = best_prediction
+                                    
+                                    # Compare with minimax evaluation of normal moves
+                                    best_normal_value = max(
+                                        self._minimax_evaluate_move(m, active, opponent, battle, depth=1) 
+                                        for m in battle.available_moves
+                                    )
+                                    
+                                    # Only use prediction if it's significantly better
+                                    if prediction_value > best_normal_value * 1.3:
+                                        self.predictions_made += 1
+                                        self._predicted_switch_last_turn = True
+                                        return self.create_order(prediction_move)
 
             # Entry hazards with enhanced logic
             for move in battle.available_moves:
@@ -1061,10 +1112,10 @@ class CustomAgent(Player):
                 base_score = self._estimate_matchup(switch, opponent)
 
                 # CRITICAL: Avoid switching into obvious bad matchups
-                if switch.species.lower() in 'zaciancrowned' and opponent.species.lower() in 'zaciancrowned':
+                if _norm_species(switch.species) == 'zaciancrowned' and _norm_species(opponent.species) == 'zaciancrowned':
                     base_score -= 1.0  # Heavy penalty for Zacian vs Zacian
                     
-                if switch.species.lower() in ['kingambit'] and opponent.species.lower() in ['zaciancrowned', 'koraidon']:
+                if _norm_species(switch.species) == 'kingambit' and _norm_species(opponent.species) in {'zaciancrowned', 'koraidon'}:
                     base_score -= 0.8  # Kingambit gets destroyed by Close Combat
                     
                 # Prefer switches that resist opponent's likely moves
@@ -1072,7 +1123,7 @@ class CustomAgent(Player):
                 for response, prob in opponent_responses.items():
                     if 'close_combat' in response and 'fairy' in str(switch.types).lower():
                         base_score += prob * 0.5  # Fairy resists Fighting
-                    elif 'behemoth_blade' in response and switch.species.lower() in ['eternatus']:
+                    elif 'behemoth_blade' in response and _norm_species(switch.species) == 'eternatus':
                         base_score += prob * 0.3  # Eternatus can live Behemoth Blade
 
                 # Bonus for unexpected switches against predictable opponents
@@ -1131,11 +1182,7 @@ class CustomAgent(Player):
             self.battle_count += 1
             self.battles_seen.add(battle_id)
         
-        # Learn opponent team composition
-        if hasattr(battle, 'opponent_team') and battle.opponent_team:
-            for species, pokemon in battle.opponent_team.items():
-                self.opponent_tracker.team_preview_seen.add(species)
-                self.opponent_tracker.add_pokemon(species, pokemon)
+        self.opponent_tracker.bootstrap_from_preview(battle)
         
         # Get opponent name for personalized strategy
         opponent_name = getattr(battle, 'opponent_username', None)
@@ -1146,7 +1193,7 @@ class CustomAgent(Player):
         # Find the preferred lead in our team
         team_list = list(battle.team.values())
         for i, pokemon in enumerate(team_list):
-            species_clean = pokemon.species.lower().replace('-', '')
+            species_clean = _norm_species(pokemon.species)
             if species_clean == preferred_lead or pokemon.species == preferred_lead:
                 return f"/team {i + 1}"
         
@@ -1154,7 +1201,7 @@ class CustomAgent(Player):
         fallback_leads = ['kingambit', 'deoxysspeed', 'zaciancrowned']
         for lead in fallback_leads:
             for i, pokemon in enumerate(team_list):
-                if pokemon.species.lower().replace('-', '') == lead or pokemon.species == lead:
+                if _norm_species(pokemon.species) == lead or pokemon.species == lead:
                     return f"/team {i + 1}"
         
         return "/team 1"
