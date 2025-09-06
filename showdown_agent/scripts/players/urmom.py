@@ -3,21 +3,16 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple
 
-from poke_env.battle import MoveCategory
 from poke_env.battle.abstract_battle import AbstractBattle
 from poke_env.battle.double_battle import DoubleBattle
 from poke_env.battle.pokemon import Pokemon
 from poke_env.battle.side_condition import SideCondition
-from poke_env.player.battle_order import BattleOrder
 from poke_env.player.player import Player
 from poke_env.data import GenData
 
 
-# =========================
-# Team
-# =========================
 team = """
 Deoxys-Speed @ Focus Sash  
 Ability: Pressure  
@@ -84,34 +79,25 @@ Jolly Nature
 """
 
 
-# =========================
-# ISMCTS Helpers (state + nodes)
-# =========================
+# ---------- lightweight sim ----------
 @dataclass
 class SimMon:
     species: str
     types: List[str]
     base_stats: Dict[str, int]
-    hp: float  # 0..1
+    hp: float
     boosts: Dict[str, int] = field(default_factory=lambda: {"atk": 0, "def": 0, "spa": 0, "spd": 0, "spe": 0})
     fainted: bool = False
 
     def clone(self) -> "SimMon":
-        return SimMon(
-            species=self.species,
-            types=list(self.types),
-            base_stats=dict(self.base_stats),
-            hp=self.hp,
-            boosts=dict(self.boosts),
-            fainted=self.fainted,
-        )
+        return SimMon(self.species, list(self.types), dict(self.base_stats), self.hp, dict(self.boosts), self.fainted)
 
 
 @dataclass
 class SimState:
     me_active: SimMon
     opp_active: SimMon
-    me_bench: Dict[str, SimMon]  # key: species
+    me_bench: Dict[str, SimMon]
     opp_bench: Dict[str, SimMon]
     me_sr: bool
     opp_sr: bool
@@ -121,66 +107,50 @@ class SimState:
 
     def clone(self) -> "SimState":
         return SimState(
-            me_active=self.me_active.clone(),
-            opp_active=self.opp_active.clone(),
-            me_bench={k: v.clone() for k, v in self.me_bench.items()},
-            opp_bench={k: v.clone() for k, v in self.opp_bench.items()},
-            me_sr=self.me_sr,
-            opp_sr=self.opp_sr,
-            me_spikes=self.me_spikes,
-            opp_spikes=self.opp_spikes,
-            terminal=self.terminal,
+            self.me_active.clone(),
+            self.opp_active.clone(),
+            {k: v.clone() for k, v in self.me_bench.items()},
+            {k: v.clone() for k, v in self.opp_bench.items()},
+            self.me_sr, self.opp_sr, self.me_spikes, self.opp_spikes, self.terminal
         )
 
 
+# ---------- IS node (our decision points only) ----------
 class ISNode:
-    """
-    Information-set node:
-      - keyed by observable features only (species, coarse HP bins, hazards).
-      - underlying determinization (sampled moves, RNG) does not change the key.
-    """
-    __slots__ = ("player", "key", "parent", "children", "N", "W", "untried")
+    __slots__ = ("key", "parent", "children", "N", "W", "untried")
 
-    def __init__(self, player: int, key: Tuple, parent: Optional["ISNode"] = None):
-        self.player = player  # 1 = us (MAX), -1 = opp (MIN)
+    def __init__(self, key: Tuple, parent: Optional["ISNode"] = None):
         self.key = key
         self.parent = parent
-        self.children: Dict[Tuple, ISNode] = {}
-        self.N: int = 0
-        self.W: float = 0.0
-        self.untried: List[Tuple] = []  # list of hashable action keys
+        # children are keyed by a JOINT edge: (my_action_key, opp_action_key)
+        self.children: Dict[Tuple[Tuple, Tuple], ISNode] = {}
+        self.N = 0
+        self.W = 0.0
+        # untried holds MY action keys; each expansion will bind one sampled opp reply
+        self.untried: List[Tuple] = []
 
     def ucb(self, c: float = 1.25) -> float:
         if self.N == 0:
             return float("inf")
-        mean = self.W / self.N
-        return mean + c * math.sqrt(math.log(max(1, self.parent.N)) / self.N)
+        return (self.W / self.N) + c * math.sqrt(math.log(max(1, self.parent.N)) / self.N)
 
-    def select(self) -> Tuple[Tuple, "ISNode"]:
+    def select(self) -> Tuple[Tuple[Tuple, Tuple], "ISNode"]:
         return max(self.children.items(), key=lambda kv: kv[1].ucb())
 
-    def add_child(self, action_key: Tuple, child: "ISNode"):
-        self.children[action_key] = child
-        try:
-            self.untried.remove(action_key)
-        except ValueError:
-            pass
+    def add_child(self, joint_key: Tuple[Tuple, Tuple], child: "ISNode"):
+        self.children[joint_key] = child
 
-    def update(self, value_for_us: float):
+    def update(self, val: float):
         self.N += 1
-        # flip sign for opponent nodes so that W accumulates "value for us" consistently
-        self.W += value_for_us if self.player == 1 else -value_for_us
+        self.W += val
 
 
-# =========================
-# Agent
-# =========================
+# ---------- agent ----------
 class CustomAgent(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(team=team, *args, **kwargs)
         self.gen = GenData.from_gen(9)
 
-        # Heuristic tables
         self.ENTRY_HAZARDS = {
             "spikes": SideCondition.SPIKES,
             "stealthrock": SideCondition.STEALTH_ROCK,
@@ -188,89 +158,75 @@ class CustomAgent(Player):
             "toxicspikes": SideCondition.TOXIC_SPIKES,
         }
         self.ANTI_HAZARDS_MOVES = {"rapidspin", "defog"}
-        self.SETUP_MOVES = {"swordsdance", "calmmind", "agility", "dragondance", "nastyplot"}
         self.PRIORITY_MOVES = {"suckerpunch", "extremespeed", "quickattack", "bulletpunch", "iceshard", "aquajet"}
-        self.RECOVERY_MOVES = {"recover", "roost", "moonlight", "synthesis", "morningsun", "slackoff", "softboiled"}
 
-        self.SPEED_TIER_COEF = 0.1
-        self.HP_COEF = 0.4
-        self.SWITCH_OUT_MATCHUP_THRESHOLD = -2.0
-
-    # ---------- Basic knowledge ----------
-    def _species_key(self, s: str) -> str:
-        return (s or "").lower().replace("-", "").replace("_", "")
-
-    def _pokedex(self, species: str) -> Dict:
-        sp = self._species_key(species)
-        data = self.gen.pokedex.get(sp, {})
-        if not data and "crowned" in sp:
-            data = self.gen.pokedex.get(sp.replace("crowned", ""), {})
-        return data
-
+    # ----- helpers -----
     def _types_of(self, species: str) -> List[str]:
-        return [t.lower() for t in self._pokedex(species).get("types", [])]
+        sp = (species or "").lower().replace("-", "").replace("_", "")
+        return [t.lower() for t in self.gen.pokedex.get(sp, {}).get("types", [])]
 
     def _base_stats_of(self, species: str) -> Dict[str, int]:
-        return self._pokedex(species).get("baseStats", {"hp": 100, "atk": 100, "def": 100, "spa": 100, "spd": 100, "spe": 100})
+        sp = (species or "").lower().replace("-", "").replace("_", "")
+        d = self.gen.pokedex.get(sp, {})
+        if not d and "crowned" in sp:
+            d = self.gen.pokedex.get(sp.replace("crowned", ""), {})
+        return d.get("baseStats", {"hp": 100, "atk": 100, "def": 100, "spa": 100, "spd": 100, "spe": 100})
 
     def _type_mult(self, atk_type: str, def_types: List[str]) -> float:
-        if not def_types:
-            return 1.0
-        eff = 1.0
+        if not def_types: return 1.0
         atk = (atk_type or "").upper()
+        eff = 1.0
         for dt in def_types:
-            d_upper = (dt or "").upper()
-            eff *= self.gen.type_chart.get(d_upper, {}).get(atk, 1.0)
+            eff *= self.gen.type_chart.get((dt or "").upper(), {}).get(atk, 1.0)
         return float(eff)
 
+    def _stat_ratio(self, atk_bs: int, def_bs: int, atk_boost: int, def_boost: int) -> float:
+        def mult(n): return (2 + n) / 2 if n > 0 else 2 / max(1, (2 - n))
+        return max(1.0, (atk_bs * mult(atk_boost)) / max(1.0, def_bs * mult(def_boost)))
+
     def _estimate_matchup(self, me: SimMon | Pokemon, opp: SimMon | Pokemon) -> float:
-        if hasattr(me, "types"):
-            my_types = [t if isinstance(t, str) else getattr(t, "name", str(t)).lower() for t in me.types]
-        else:
-            my_types = [getattr(t, "name", str(t)).lower() for t in getattr(me, "types", []) if t]
-
-        if hasattr(opp, "types"):
-            opp_types = [t if isinstance(t, str) else getattr(t, "name", str(t)).lower() for t in opp.types]
-        else:
-            opp_types = [getattr(t, "name", str(t)).lower() for t in getattr(opp, "types", []) if t]
-
+        my_types = [getattr(t, "name", t).lower() for t in (me.types if isinstance(me, SimMon) else me.types) if t]
+        opp_types = [getattr(t, "name", t).lower() for t in (opp.types if isinstance(opp, SimMon) else opp.types) if t]
         off = max([self._type_mult(t, opp_types) for t in my_types], default=1.0)
         deff = max([self._type_mult(t, my_types) for t in opp_types], default=1.0)
         score = off - deff
-
         try:
             my_spe = me.base_stats["spe"] if isinstance(me, SimMon) else me.base_stats["spe"]
             op_spe = opp.base_stats["spe"] if isinstance(opp, SimMon) else opp.base_stats["spe"]
-            if my_spe > op_spe:
-                score += self.SPEED_TIER_COEF
-            elif op_spe > my_spe:
-                score -= self.SPEED_TIER_COEF
+            score += 0.1 if my_spe > op_spe else (-0.1 if op_spe > my_spe else 0.0)
         except Exception:
             pass
-
         try:
             my_hp = me.hp if isinstance(me, SimMon) else (me.current_hp_fraction or 0.0)
             op_hp = opp.hp if isinstance(opp, SimMon) else (opp.current_hp_fraction or 0.0)
-            score += my_hp * self.HP_COEF
-            score -= op_hp * self.HP_COEF
+            score += (my_hp - op_hp) * 0.4
         except Exception:
             pass
         return float(score)
 
-    def _stat_ratio(self, atk_bs: int, def_bs: int, atk_boost: int, def_boost: int) -> float:
-        def boost_mult(n):
-            return (2 + n) / 2 if n > 0 else 2 / max(1, (2 - n))
-        return max(1.0, (atk_bs * boost_mult(atk_boost)) / max(1.0, def_bs * boost_mult(def_boost)))
+    # NEW: abstract actions for simulated states (deeper than root)
+    def _legal_my_actions_sim(self, s: SimState) -> List[tuple]:
+        acts = []
+        types = s.me_active.types or ["normal"]
+        for t in types:
+            acts.append(("move", f"stab_{t}_P"))  # physical STAB proxy
+            acts.append(("move", f"stab_{t}_S"))  # special STAB proxy
+        for sp in self._best_switch_candidates(s, k=2):
+            acts.append(("switch", sp))
+        return acts
 
-    # ---------- Move metadata ----------
     def _move_meta(self, move_id: str) -> Dict:
+        if move_id.startswith("stab_"):  # e.g., "stab_dark_P"
+            _, t, kind = move_id.split("_", 2)
+            return {
+                "id": move_id,
+                "type": t.lower(),
+                "bp": 85 if kind == "P" else 90,  # small bias to special if you like
+                "category": "Physical" if kind == "P" else "Special",
+                "accuracy": 0.95,
+                "priority": 0,
+            }
         m = self.gen.moves.get(move_id, {})
-        recoil = m.get("recoil", 0)
-        if isinstance(recoil, list):
-            recoil = abs(recoil[0])
-        heal = m.get("heal", 0)
-        if isinstance(heal, list):
-            heal = heal[0]
         return {
             "id": move_id,
             "type": (m.get("type") or "").lower(),
@@ -278,363 +234,325 @@ class CustomAgent(Player):
             "category": m.get("category", "Status"),
             "accuracy": m.get("accuracy", 1.0) if m.get("accuracy") is not None else 1.0,
             "priority": m.get("priority", 0) or 0,
-            "recoil": recoil or 0,
-            "heal": heal or 0,
-            "target": m.get("target", "normal"),
-            "secondary": m.get("secondary", None),
         }
 
-    # ---------- Determinization ----------
-    def _sample_opponent_moveset(self, species: str, revealed: List[str]) -> List[str]:
-        revealed_norm = set((mid or "").lower() for mid in revealed)
-        types = self._types_of(species)
-        candidates = []
+    # ----- determinization -----
+    def _sample_opp_moveset(self, species: str, revealed: List[str]) -> List[str]:
+        keep = {m.lower() for m in revealed if m}
+        types = set(self._types_of(species))
+        pool: List[str] = []
         for mid, md in self.gen.moves.items():
             t = (md.get("type") or "").lower()
             bp = md.get("basePower", 0) or 0
             cat = md.get("category", "Status")
             if cat in ("Physical", "Special") and bp >= 60:
-                stab_bonus = 2 if t in types else 1
-                for _ in range(stab_bonus):
-                    candidates.append(mid)
-        if not candidates:
-            candidates = list(self.gen.moves.keys())
+                weight = 3 if t in types else 1
+                pool.extend([mid] * weight)
+        if not pool:
+            pool = list(self.gen.moves.keys())
+        while len(keep) < 4:
+            keep.add(random.choice(pool).lower())
+        return list(keep)[:4]
 
-        chosen: List[str] = [m for m in revealed_norm if m]
-        tries = 0
-        while len(chosen) < 4 and tries < 64:
-            m = random.choice(candidates).lower()
-            if m not in chosen:
-                chosen.append(m)
-            tries += 1
-        return chosen[:4]
-
-    # ---------- Forward model ----------
-    def _damage_proxy(self, atk: SimMon, move_meta: Dict, defender: SimMon) -> float:
-        teff = self._type_mult(move_meta["type"], defender.types) if move_meta["type"] else 1.0
-        if teff == 0.0 or move_meta["category"] == "Status" or move_meta["bp"] == 0:
-            return 0.0
-
-        if move_meta["category"] == "Physical":
-            ratio = self._stat_ratio(atk.base_stats["atk"], defender.base_stats["def"], atk.boosts["atk"], defender.boosts["def"])
+    # ----- forward model -----
+    def _damage_proxy(self, atk: SimMon, md: Dict, dfn: SimMon) -> float:
+        if md["category"] == "Status" or md["bp"] <= 0: return 0.0
+        teff = self._type_mult(md["type"], dfn.types)
+        if teff == 0.0: return 0.0
+        if md["category"] == "Physical":
+            ratio = self._stat_ratio(atk.base_stats["atk"], dfn.base_stats["def"], atk.boosts["atk"], dfn.boosts["def"])
         else:
-            ratio = self._stat_ratio(atk.base_stats["spa"], defender.base_stats["spd"], atk.boosts["spa"], defender.boosts["spd"])
-
-        stab = 1.5 if move_meta["type"] in atk.types else 1.0
-        acc = move_meta["accuracy"] if isinstance(move_meta["accuracy"], (int, float)) else 1.0
-        base = move_meta["bp"] * ratio * stab * teff * acc
+            ratio = self._stat_ratio(atk.base_stats["spa"], dfn.base_stats["spd"], atk.boosts["spa"], dfn.boosts["spd"])
+        stab = 1.5 if md["type"] in atk.types else 1.0
+        acc = md["accuracy"] if isinstance(md["accuracy"], (int, float)) else 1.0
+        base = md["bp"] * ratio * stab * teff * acc
         return max(0.0, min(1.0, base / 300.0))
 
-    def _apply_attack(self, state: SimState, attacker_is_me: bool, move_meta: Dict):
-        atk = state.me_active if attacker_is_me else state.opp_active
-        dfn = state.opp_active if attacker_is_me else state.me_active
-        dmg = self._damage_proxy(atk, move_meta, dfn)
-        roll = random.uniform(0.85, 1.0)
-        dph = dmg * roll
-        dfn.hp = max(0.0, dfn.hp - dph)
+    def _apply_attack(self, s: SimState, attacker_is_me: bool, md: Dict):
+        atk = s.me_active if attacker_is_me else s.opp_active
+        dfn = s.opp_active if attacker_is_me else s.me_active
+        dmg = self._damage_proxy(atk, md, dfn) * random.uniform(0.85, 1.0)
+        dfn.hp = max(0.0, dfn.hp - dmg)
         if dfn.hp <= 0.0:
             dfn.fainted = True
 
-    def _apply_switch_in_hazards(self, state: SimState, switch_is_me: bool):
-        sr = state.me_sr if switch_is_me else state.opp_sr
-        spikes_layers = state.me_spikes if switch_is_me else state.opp_spikes
-        mon = state.me_active if switch_is_me else state.opp_active
-
+    def _apply_switch_in_hazards(self, s: SimState, switch_is_me: bool):
+        sr = s.me_sr if switch_is_me else s.opp_sr
+        spikes = s.me_spikes if switch_is_me else s.opp_spikes
+        mon = s.me_active if switch_is_me else s.opp_active
         total = 0.0
         if sr:
-            teff = self._type_mult("rock", mon.types)
-            total += min(0.5, 0.125 * teff)
-        if spikes_layers > 0:
-            total += {1: 0.125, 2: 0.167, 3: 0.25}.get(spikes_layers, 0.125)
-
+            total += min(0.5, 0.125 * self._type_mult("rock", mon.types))
+        if spikes:
+            total += {1: 0.125, 2: 0.167, 3: 0.25}.get(spikes, 0.125)
         mon.hp = max(0.0, mon.hp - total)
         if mon.hp <= 0.0:
             mon.fainted = True
 
-    # ---------- State evaluation ----------
-    def _eval_state(self, s: SimState) -> float:
-        if s.me_active.fainted and s.opp_active.fainted and not s.me_bench and not s.opp_bench:
-            return 0.0
-        if s.me_active.fainted and not s.me_bench:
-            return -10.0
-        if s.opp_active.fainted and not s.opp_bench:
-            return +10.0
-
+    # ----- evaluation -----
+    def _eval(self, s: SimState) -> float:
+        if s.me_active.fainted and not s.me_bench: return -10.0
+        if s.opp_active.fainted and not s.opp_bench: return 10.0
         my_hp = s.me_active.hp + sum(m.hp for m in s.me_bench.values())
         op_hp = s.opp_active.hp + sum(m.hp for m in s.opp_bench.values())
         mu = self._estimate_matchup(s.me_active, s.opp_active)
-        my_alive = 1 + sum(1 for m in s.me_bench.values() if not m.fainted and m.hp > 0)
-        op_alive = 1 + sum(1 for m in s.opp_bench.values() if not m.fainted and m.hp > 0)
-        return (my_hp - op_hp) * 3.0 + mu * 2.0 + (my_alive - op_alive) * 1.0
+        return (my_hp - op_hp) * 2.5 + mu * 2.0
 
-    # ---------- Information set key ----------
-    def _hp_bin(self, hp: float) -> int:
-        return int((hp if hp is not None else 0.0) * 10)
+    # ----- info-set key -----
+    def _hp_bin(self, hp: float) -> int: return int(max(0.0, min(1.0, hp)) * 10)
 
-    def _node_key(self, s: SimState, player: int) -> Tuple:
+    def _node_key(self, s: SimState) -> Tuple:
         return (
-            player,
-            s.me_active.species,
-            self._hp_bin(s.me_active.hp),
-            s.opp_active.species,
-            self._hp_bin(s.opp_active.hp),
-            tuple(sorted([(k, self._hp_bin(m.hp)) for k, m in s.me_bench.items()])),
-            tuple(sorted([(k, self._hp_bin(m.hp)) for k, m in s.opp_bench.items()])),
-            s.me_sr,
-            s.opp_sr,
-            s.me_spikes,
-            s.opp_spikes,
+            s.me_active.species, self._hp_bin(s.me_active.hp),
+            s.opp_active.species, self._hp_bin(s.opp_active.hp),
+            tuple(sorted((k, self._hp_bin(v.hp)) for k, v in s.me_bench.items())),
+            tuple(sorted((k, self._hp_bin(v.hp)) for k, v in s.opp_bench.items())),
+            s.me_sr, s.opp_sr, s.me_spikes, s.opp_spikes
         )
 
-    # ---------- Build initial SimState from live battle ----------
-    def _to_simstate(self, battle: AbstractBattle) -> SimState:
-        me_act = battle.active_pokemon
-        op_act = battle.opponent_active_pokemon
+    # ----- build state -----
+    def _to_sim(self, battle: AbstractBattle) -> SimState:
+        me = battle.active_pokemon
+        op = battle.opponent_active_pokemon
+        me_active = SimMon(me.species, [t.name.lower() for t in me.types if t], me.base_stats, me.current_hp_fraction or 0.0)
+        opp_active = SimMon(op.species, [t.name.lower() for t in op.types if t], op.base_stats, op.current_hp_fraction or 0.0)
 
-        me_active = SimMon(
-            species=me_act.species,
-            types=[getattr(t, "name", str(t)).lower() for t in me_act.types if t],
-            base_stats=me_act.base_stats,
-            hp=(me_act.current_hp_fraction or 0.0),
-        )
-        opp_active = SimMon(
-            species=op_act.species,
-            types=[getattr(t, "name", str(t)).lower() for t in op_act.types if t],
-            base_stats=op_act.base_stats,
-            hp=(op_act.current_hp_fraction or 0.0),
-        )
-
-        me_bench = {}
+        me_bench, opp_bench = {}, {}
         for p in battle.team.values():
-            if p is me_act:
-                continue
-            me_bench[p.species] = SimMon(
-                species=p.species,
-                types=[getattr(t, "name", str(t)).lower() for t in p.types if t],
-                base_stats=p.base_stats,
-                hp=(p.current_hp_fraction or 0.0),
-                fainted=bool(p.fainted),
-            )
-
-        opp_bench = {}
+            if p is me: continue
+            me_bench[p.species] = SimMon(p.species, [t.name.lower() for t in p.types if t], p.base_stats, p.current_hp_fraction or 0.0, fainted=bool(p.fainted))
         for p in battle.opponent_team.values():
-            if p and (not p.fainted) and p is not op_act:
-                opp_bench[p.species] = SimMon(
-                    species=p.species,
-                    types=[getattr(t, "name", str(t)).lower() for t in p.types if t],
-                    base_stats=p.base_stats,
-                    hp=(p.current_hp_fraction or 0.0) if p.current_hp_fraction is not None else 1.0,
-                    fainted=bool(p.fainted),
-                )
+            if p and (not p.fainted) and p is not op:
+                opp_bench[p.species] = SimMon(p.species, [t.name.lower() for t in p.types if t], p.base_stats, p.current_hp_fraction or 1.0, fainted=bool(p.fainted))
 
         me_sr = SideCondition.STEALTH_ROCK in battle.side_conditions
         opp_sr = SideCondition.STEALTH_ROCK in battle.opponent_side_conditions
         me_spikes = battle.side_conditions.get(SideCondition.SPIKES, 0)
         opp_spikes = battle.opponent_side_conditions.get(SideCondition.SPIKES, 0)
 
-        return SimState(
-            me_active=me_active,
-            opp_active=opp_active,
-            me_bench=me_bench,
-            opp_bench=opp_bench,
-            me_sr=me_sr,
-            opp_sr=opp_sr,
-            me_spikes=me_spikes,
-            opp_spikes=opp_spikes,
-        )
+        return SimState(me_active, opp_active, me_bench, opp_bench, me_sr, opp_sr, me_spikes, opp_spikes)
 
-    # ---------- Legal actions as HASHABLE KEYS ----------
-    def _legal_my_action_keys(self, battle: AbstractBattle) -> List[Tuple]:
-        # only moves inside ISMCTS (switching handled by outer policy)
-        return [("move", m.id) for m in battle.available_moves]
+    # ----- actions -----
+    def _best_switch_candidates(self, s: SimState, k: int = 2) -> List[str]:
+        if not s.me_bench: return []
+        items = list(s.me_bench.items())
+        items.sort(key=lambda kv: self._estimate_matchup(kv[1], s.opp_active), reverse=True)
+        return [sp for sp, _ in items[:k]]
 
-    def _legal_opp_action_keys(self, s: SimState, opp_moveset: List[str]) -> List[Tuple]:
-        acts: List[Tuple] = []
-        for mid in opp_moveset:
-            acts.append(("opp_move", mid))
+    def _legal_my_actions(self, battle: AbstractBattle, s: SimState) -> List[Tuple]:
+        acts = [("move", m.id) for m in battle.available_moves]
+        for sp in self._best_switch_candidates(s, 2):
+            acts.append(("switch", sp))
+        return acts
+
+    def _legal_opp_actions(self, s: SimState, opp_moveset: List[str]) -> List[Tuple]:
+        acts = [("opp_move", mid) for mid in opp_moveset]
         for sp, mon in s.opp_bench.items():
             if not mon.fainted and mon.hp > 0.0:
                 acts.append(("opp_switch", sp))
         return acts if acts else [("opp_pass", None)]
 
-    # ---------- Apply actions from KEYS ----------
-    def _do_my_action_key(self, s: SimState, action_key: Tuple):
-        kind, payload = action_key
-        if kind == "move":
-            md = self._move_meta(payload)  # payload is move_id
-            self._apply_attack(s, attacker_is_me=True, move_meta=md)
-            if s.opp_active.fainted:
-                if s.opp_bench:
-                    sw = max(s.opp_bench.values(), key=lambda mm: mm.hp)
-                    s.opp_active = sw.clone()
-                    del s.opp_bench[sw.species]
-                    self._apply_switch_in_hazards(s, switch_is_me=False)
-                else:
-                    s.terminal = True
-
-    def _do_opp_action_key(self, s: SimState, action_key: Tuple):
-        kind, payload = action_key
-        if kind == "opp_move":
-            md = self._move_meta(payload)  # payload is move_id
-            self._apply_attack(s, attacker_is_me=False, move_meta=md)
-            if s.me_active.fainted:
-                if s.me_bench:
-                    sw = max(s.me_bench.values(), key=lambda mm: mm.hp)
-                    s.me_active = sw.clone()
-                    del s.me_bench[sw.species]
-                    self._apply_switch_in_hazards(s, switch_is_me=True)
-                else:
-                    s.terminal = True
-        elif kind == "opp_switch":
-            sp = payload
-            if sp in s.opp_bench:
+    # ----- joint turn application -----
+    def _apply_joint(self, s: SimState, my_ak: Tuple, opp_ak: Tuple):
+        # Switches happen before attacks
+        # 1) both switch
+        if my_ak[0] == "switch" and opp_ak[0] == "opp_switch":
+            # my switch
+            sp = my_ak[1]
+            if sp in s.me_bench:
+                if not s.me_active.fainted and s.me_active.hp > 0:
+                    s.me_bench[s.me_active.species] = s.me_active.clone()
+                s.me_active = s.me_bench[sp].clone()
+                del s.me_bench[sp]
+                self._apply_switch_in_hazards(s, True)
+            # opp switch
+            sp2 = opp_ak[1]
+            if sp2 in s.opp_bench:
                 if not s.opp_active.fainted and s.opp_active.hp > 0:
                     s.opp_bench[s.opp_active.species] = s.opp_active.clone()
-                s.opp_active = s.opp_bench[sp].clone()
-                del s.opp_bench[sp]
-                self._apply_switch_in_hazards(s, switch_is_me=False)
-        else:
-            pass
+                s.opp_active = s.opp_bench[sp2].clone()
+                del s.opp_bench[sp2]
+                self._apply_switch_in_hazards(s, False)
+            return
 
-    # ---------- Rollout ----------
-    def _rollout_policy(self, s: SimState, opp_moveset: List[str], depth: int = 2) -> float:
+        # 2) my switch, opp attacks
+        if my_ak[0] == "switch" and opp_ak[0] != "opp_switch":
+            sp = my_ak[1]
+            if sp in s.me_bench:
+                if not s.me_active.fainted and s.me_active.hp > 0:
+                    s.me_bench[s.me_active.species] = s.me_active.clone()
+                s.me_active = s.me_bench[sp].clone()
+                del s.me_bench[sp]
+                self._apply_switch_in_hazards(s, True)
+            if opp_ak[0] == "opp_move":
+                self._apply_attack(s, False, self._move_meta(opp_ak[1]))
+            return
+
+        # 3) opp switch, my attack
+        if opp_ak[0] == "opp_switch" and my_ak[0] != "switch":
+            sp2 = opp_ak[1]
+            if sp2 in s.opp_bench:
+                if not s.opp_active.fainted and s.opp_active.hp > 0:
+                    s.opp_bench[s.opp_active.species] = s.opp_active.clone()
+                s.opp_active = s.opp_bench[sp2].clone()
+                del s.opp_bench[sp2]
+                self._apply_switch_in_hazards(s, False)
+            if my_ak[0] == "move":
+                self._apply_attack(s, True, self._move_meta(my_ak[1]))
+            return
+
+        # 4) attack vs attack → priority then speed
+        if my_ak[0] == "move" and opp_ak[0] == "opp_move":
+            my_md = self._move_meta(my_ak[1])
+            op_md = self._move_meta(opp_ak[1])
+            my_pri, op_pri = my_md["priority"], op_md["priority"]
+            my_spe = s.me_active.base_stats.get("spe", 100) + s.me_active.boosts.get("spe", 0)
+            op_spe = s.opp_active.base_stats.get("spe", 100) + s.opp_active.boosts.get("spe", 0)
+            my_first = (my_pri > op_pri) or (my_pri == op_pri and my_spe >= op_spe)
+
+            if my_first:
+                self._apply_attack(s, True, my_md)
+                if not s.opp_active.fainted:
+                    self._apply_attack(s, False, op_md)
+            else:
+                self._apply_attack(s, False, op_md)
+                if not s.me_active.fainted:
+                    self._apply_attack(s, True, my_md)
+            return
+
+        # 5) any pass
+        if my_ak[0] == "move" and opp_ak[0] == "opp_pass":
+            self._apply_attack(s, True, self._move_meta(my_ak[1]))
+        # if my_ak is switch and opp_pass, switch only handled above
+
+        # auto-switch on faint (greedy highest HP)
+        if s.opp_active.fainted:
+            if s.opp_bench:
+                sw = max(s.opp_bench.values(), key=lambda mm: mm.hp)
+                s.opp_active = sw.clone()
+                del s.opp_bench[sw.species]
+                self._apply_switch_in_hazards(s, False)
+            else:
+                s.terminal = True
+        if s.me_active.fainted:
+            if s.me_bench:
+                sw = max(s.me_bench.values(), key=lambda mm: mm.hp)
+                s.me_active = sw.clone()
+                del s.me_bench[sw.species]
+                self._apply_switch_in_hazards(s, True)
+            else:
+                s.terminal = True
+
+    # ----- opp reply policy (ε-greedy over Top-K) -----
+    def _opp_topk_sample(self, s: SimState, opp_actions: List[Tuple], k: int = 3, eps: float = 0.1) -> Tuple:
+        scored = []
+        for a in opp_actions:
+            if a[0] == "opp_move":
+                val = self._damage_proxy(s.opp_active, self._move_meta(a[1]), s.me_active)
+            elif a[0] == "opp_switch":
+                val = s.opp_bench[a[1]].hp if a[1] in s.opp_bench else 0.0
+            else:
+                val = 0.0
+            scored.append((val, a))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [a for _, a in scored[:max(1, k)]]
+        if random.random() < eps:
+            return random.choice(opp_actions)
+        return random.choice(top)
+
+    # ----- rollout (joint turns, shallow) -----
+    def _rollout(self, s: SimState, opp_moveset: List[str], depth: int = 2) -> float:
         d = 0
         while (not s.terminal) and d < depth:
-            # our greedy synthetic STAB move (fast)
-            best_md = None
-            best_score = -1.0
-            for t in s.me_active.types:
-                md = {"id": f"stab_{t}", "type": t, "bp": 90, "category": "Physical", "accuracy": 0.95}
+            # pick a rough best move for us (phys/special by higher stat)
+            use_phys = s.me_active.base_stats.get("atk", 100) >= s.me_active.base_stats.get("spa", 100)
+            my_md = None
+            best = -1.0
+            for t in (s.me_active.types or ["normal"]):
+                md = {"id": f"stab_{t}_{'P' if use_phys else 'S'}", "type": t, "bp": 90,
+                      "category": "Physical" if use_phys else "Special", "accuracy": 0.95, "priority": 0}
                 sc = self._damage_proxy(s.me_active, md, s.opp_active)
-                if sc > best_score:
-                    best_score, best_md = sc, md
-            if best_md:
-                self._apply_attack(s, attacker_is_me=True, move_meta=best_md)
-                if s.opp_active.fainted:
-                    if s.opp_bench:
-                        sw = max(s.opp_bench.values(), key=lambda mm: mm.hp)
-                        s.opp_active = sw.clone()
-                        del s.opp_bench[sw.species]
-                        self._apply_switch_in_hazards(s, switch_is_me=False)
-                    else:
-                        s.terminal = True
-                        break
+                if sc > best:
+                    best, my_md = sc, md
+            my_ak = ("move", my_md["id"]) if my_md else ("move", "tackle")
 
-            # opponent greedy response
-            opp_actions = self._legal_opp_action_keys(s, opp_moveset)
-            best_a, best_val = None, -1.0
-            for a in opp_actions:
-                if a[0] == "opp_move":
-                    val = self._damage_proxy(s.opp_active, self._move_meta(a[1]), s.me_active)
-                elif a[0] == "opp_switch":
-                    val = s.opp_bench[a[1]].hp
-                else:
-                    val = 0.0
-                if val > best_val:
-                    best_val, best_a = val, a
-            self._do_opp_action_key(s, best_a)
+            opp_acts = self._legal_opp_actions(s, opp_moveset)
+            opp_ak = self._opp_topk_sample(s, opp_acts, k=3, eps=0.1)
+
+            self._apply_joint(s, my_ak, opp_ak)
             d += 1
+        return self._eval(s)
 
-        return self._eval_state(s)
+    # ----- ISMCTS (joint turn) -----
+    def _ismcts(self, battle: AbstractBattle, iters: int = 256) -> Tuple[str, Optional[str]]:
+        root_state = self._to_sim(battle)
+        my_actions = self._legal_my_actions(battle, root_state)
+        if not my_actions:
+            return ("pass", None)
 
-    # ---------- ISMCTS core ----------
-    def _ismcts(self, battle: AbstractBattle, iters: int = 96) -> Optional:
-        root_state = self._to_simstate(battle)
+        revealed = list(battle.opponent_active_pokemon.moves.keys())
+        root = ISNode(self._node_key(root_state), None)
+        root.untried = list(my_actions)
 
-        # Map move_id -> Move object so we can return a real order at the end
-        move_by_id = {m.id: m for m in battle.available_moves}
-        my_action_keys = self._legal_my_action_keys(battle)
-        if not my_action_keys:
-            return None
+        # We also need a map to count visits per MY action (aggregating different opp replies)
+        visit_by_my_action: Dict[Tuple, int] = {}
 
-        root = ISNode(player=1, key=self._node_key(root_state, player=1), parent=None)
-        root.untried = list(my_action_keys)
-
-        for _ in range(max(iters, 16)):
-            # determinize hidden info
-            revealed = list(battle.opponent_active_pokemon.moves.keys())
-            opp_moveset = self._sample_opponent_moveset(battle.opponent_active_pokemon.species, revealed=revealed)
-
+        for _ in range(max(32, iters)):
             state = root_state.clone()
             node = root
+            # fresh determinization each iter
+            opp_moveset = self._sample_opp_moveset(battle.opponent_active_pokemon.species, revealed)
 
             # Selection
             while not node.untried and node.children and not state.terminal:
-                _, node = node.select()
+                joint_key, child = node.select()
+                my_ak, opp_ak = joint_key
+                self._apply_joint(state, my_ak, opp_ak)
+                node = child
 
             # Expansion
             if node.untried and not state.terminal:
-                ak = random.choice(node.untried)  # action key
+                my_ak = random.choice(node.untried)
+                opp_ak = self._opp_topk_sample(state, self._legal_opp_actions(state, opp_moveset), k=3, eps=0.2)
                 child_state = state.clone()
-                if node.player == 1:
-                    self._do_my_action_key(child_state, ak)
-                    next_player = -1
-                else:
-                    self._do_opp_action_key(child_state, ak)
-                    next_player = 1
-
-                child_key = self._node_key(child_state, next_player)
-                child = ISNode(player=next_player, key=child_key, parent=node)
-                child.untried = (
-                    self._legal_opp_action_keys(child_state, opp_moveset) if next_player == -1 else list(my_action_keys)
-                )
-                node.add_child(ak, child)
+                self._apply_joint(child_state, my_ak, opp_ak)
+                child = ISNode(self._node_key(child_state), node)
+                child.untried = self._legal_my_actions_sim(child_state)
+                node.add_child((my_ak, opp_ak), child)
+                # leave my_ak in untried? no — consume once to cap branching
+                node.untried.remove(my_ak)
                 node = child
                 state = child_state
 
             # Rollout
-            value = self._rollout_policy(state.clone(), opp_moveset, depth=2)
+            value = self._rollout(state.clone(), opp_moveset, depth=3)
 
             # Backprop
-            while node is not None:
-                node.update(value_for_us=value)
-                node = node.parent
+            cur = node
+            while cur:
+                cur.update(value)
+                cur = cur.parent
 
-        if not root.children:
-            return None
-        # Best by visits
-        best_key, _child = max(root.children.items(), key=lambda kv: kv[1].N)
-        # best_key is ('move', move_id)
-        if best_key[0] != "move":
-            return None
-        mid = best_key[1]
-        return move_by_id.get(mid)
+        # Choose best root move by aggregated child visits
+        for (my_ak, _opp_ak), child in root.children.items():
+            visit_by_my_action[my_ak] = visit_by_my_action.get(my_ak, 0) + child.N
+        if not visit_by_my_action:
+            return ("pass", None)
+        best_my_action = max(visit_by_my_action.items(), key=lambda kv: kv[1])[0]
+        kind, payload = best_my_action
+        if kind == "move":
+            return ("move", payload)
+        else:
+            return ("switch", payload)
 
-    # ---------- High-level policy (preserves your heuristics) ----------
-    def _protect_win_condition_now(self, battle: AbstractBattle) -> bool:
-        active = battle.active_pokemon
-        opp = battle.opponent_active_pokemon
-        if not active or not opp:
-            return False
-        if active.species.lower() not in {"koraidon", "zaciancrowned"}:
-            return False
-        mu = self._estimate_matchup(
-            SimMon(active.species, [t.name.lower() for t in active.types if t], active.base_stats, active.current_hp_fraction or 0.0),
-            SimMon(opp.species, [t.name.lower() for t in opp.types if t], opp.base_stats, opp.current_hp_fraction or 0.0),
-        )
-        if mu < -1.5:
-            return True
-        if (active.current_hp_fraction or 0.0) < 0.4 and any(mid in self.PRIORITY_MOVES for mid in opp.moves):
-            return True
-        return False
-
+    # ----- outer policy -----
     def choose_move(self, battle: AbstractBattle):
         if isinstance(battle, DoubleBattle):
             return self.choose_random_doubles_move(battle)
-
-        if battle.active_pokemon is None or battle.opponent_active_pokemon is None:
+        if not battle.active_pokemon or not battle.opponent_active_pokemon:
             return self.choose_random_move(battle)
 
-        # Protect win-cons via simple switch rule
-        if self._protect_win_condition_now(battle) and battle.available_switches:
-            opp = battle.opponent_active_pokemon
-            best_sw = max(battle.available_switches, key=lambda s: self._estimate_matchup(
-                SimMon(s.species, [t.name.lower() for t in s.types if t], s.base_stats, s.current_hp_fraction or 0.0),
-                SimMon(opp.species, [t.name.lower() for t in opp.types if t], opp.base_stats, opp.current_hp_fraction or 0.0)
-            ))
-            return self.create_order(best_sw)
-
-        # Opportunistic hazards/clear before search
+        # quick, cheap heuristics first (hazards / clear)
         if battle.available_moves:
             n_opp_remaining = 6 - sum(1 for p in battle.opponent_team.values() if p and p.fainted)
             for m in battle.available_moves:
@@ -643,34 +561,40 @@ class CustomAgent(Player):
                 if battle.side_conditions and m.id in self.ANTI_HAZARDS_MOVES:
                     return self.create_order(m)
 
-        # Run ISMCTS to pick our move
+        # run ISMCTS
         if battle.available_moves:
-            best = self._ismcts(battle, iters=96)
-            if best is not None:
-                return self.create_order(best)
+            decision, payload = self._ismcts(battle, iters=160)
+            if decision == "move":
+                mv = next((m for m in battle.available_moves if m.id == payload), None)
+                if mv is not None:
+                    return self.create_order(mv)
+            elif decision == "switch" and battle.available_switches:
+                # map species → actual switch object
+                sw = next((s for s in battle.available_switches if s.species == payload), None)
+                if sw is not None:
+                    return self.create_order(sw)
 
-        # Else switch by heuristic
+        # fallback: best switch by matchup
         if battle.available_switches:
             opp = battle.opponent_active_pokemon
-            return self.create_order(max(battle.available_switches, key=lambda s: self._estimate_matchup(
-                SimMon(s.species, [t.name.lower() for t in s.types if t], s.base_stats, s.current_hp_fraction or 0.0),
-                SimMon(opp.species, [t.name.lower() for t in opp.types if t], opp.base_stats, opp.current_hp_fraction or 0.0)
-            )))
+            def mu(s):
+                me = SimMon(s.species, [t.name.lower() for t in s.types if t], s.base_stats, s.current_hp_fraction or 0.0)
+                op = SimMon(opp.species, [t.name.lower() for t in opp.types if t], opp.base_stats, opp.current_hp_fraction or 0.0)
+                return self._estimate_matchup(me, op)
+            sw = max(battle.available_switches, key=mu)
+            return self.create_order(sw)
 
         return self.choose_random_move(battle)
 
-    # Team preview
+    # team preview
     def teampreview(self, battle):
+        order = ["zaciancrowned", "kingambit", "deoxysspeed"]
         team_list = list(battle.team.values())
-        lead_priority = ["zaciancrowned", "kingambit", "deoxysspeed"]
-        for pref in lead_priority:
+        for pref in order:
             for i, p in enumerate(team_list):
                 if p.species == pref:
                     return f"/team {i + 1}"
         return "/team 1"
 
-    def choose_team_preview(self, battle):
-        return self.teampreview(battle)
-
-    def team_preview(self, battle):
-        return self.teampreview(battle)
+    def choose_team_preview(self, battle): return self.teampreview(battle)
+    def team_preview(self, battle): return self.teampreview(battle)

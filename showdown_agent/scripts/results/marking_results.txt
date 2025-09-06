@@ -1,0 +1,4 @@
+minimax #1 10.0
+pure-heruistics #1 10.0
+hybrid #2 9.5
+urmom #10 5.5
