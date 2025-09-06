@@ -1,1 +1,2 @@
-ratk825 #1 10.0
+minimax #1 10.0
+pure-heruistics #1 10.0
