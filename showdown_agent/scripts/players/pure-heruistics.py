@@ -999,7 +999,7 @@ class CustomAgent(Player):
         team_list = list(battle.team.values())
         
         # Safer lead priority: Zacian (versatile) > Kingambit (trades well) > Deoxys (risky but rewarding)
-        lead_priority = ['zaciancrowned', 'kingambit', 'deoxysspeed']
+        lead_priority = ['deoxysspeed']
         
         for preferred_lead in lead_priority:
             for i, pokemon in enumerate(team_list):
