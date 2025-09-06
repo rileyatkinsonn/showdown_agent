@@ -81,8 +81,6 @@ class CustomAgent(Player):
         super().__init__(team=team, *args, **kwargs)
         
         # Battle state tracking
-        self._last_switched_turn = -2
-        self._tera_used = False
         self.gen_data = GenData.from_gen(9)  # Gen 9 type chart and data
         
         
@@ -816,18 +814,18 @@ class CustomAgent(Player):
                 type_effectiveness = opponent.damage_multiplier(m)
                 if type_effectiveness == 0:
                     continue
-                    
-                base_score = (m.base_power
-                              * (1.5 if m.type in active.types else 1)
-                              * (
-                                  physical_ratio
-                                  if m.category == MoveCategory.PHYSICAL
-                                  else special_ratio
-                              )
-                              * m.accuracy
-                              * m.expected_hits
+
+                acc = m.accuracy if m.accuracy is not None else 1.0
+                hits = getattr(m, "expected_hits", 1) or 1
+                bp = getattr(m, "base_power", 0) or 0
+
+                base_score = (bp
+                              * (1.5 if m.type in active.types else 1.0)
+                              * (physical_ratio if m.category == MoveCategory.PHYSICAL else special_ratio)
+                              * acc
+                              * hits
                               * type_effectiveness)
-                
+
                 # Add move value analysis from GenData
                 move_value = self._analyze_move_value(m, battle)
                 base_score += move_value * 10  # Scale the bonus appropriately
@@ -965,7 +963,7 @@ class CustomAgent(Player):
 
             # Enhanced switch selection considering opponent team
             predicted_switch = self._predict_opponent_switch(battle)
-            
+
             if predicted_switch:
                 # Switch to counter predicted opponent switch
                 best_vs_predicted = max(

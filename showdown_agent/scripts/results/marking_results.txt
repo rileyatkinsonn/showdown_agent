@@ -1,2 +1,3 @@
 minimax #1 10.0
 pure-heruistics #1 10.0
+minmax-edited #1 10.0
